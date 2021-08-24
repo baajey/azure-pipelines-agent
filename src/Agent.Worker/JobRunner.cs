@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
@@ -23,6 +24,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
     public interface IJobRunner : IAgentService
     {
         Task<TaskResult> RunAsync(Pipelines.AgentJobRequestMessage message, CancellationToken jobRequestCancellationToken);
+        void UpdateMetadata(JobMetadataMessage message);
     }
 
     public sealed class JobRunner : AgentService, IJobRunner
@@ -146,9 +148,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 Directory.CreateDirectory(toolsDirectory);
                 jobContext.SetVariable(Constants.Variables.Agent.ToolsDirectory, toolsDirectory, isFilePath: true);
 
-                bool disableGitPrompt = jobContext.Variables.GetBoolean("VSTS_DISABLE_GIT_PROMPT") ?? StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("VSTS_DISABLE_GIT_PROMPT"), true);
-                if (disableGitPrompt &&
-                    string.IsNullOrEmpty(jobContext.Variables.Get("GIT_TERMINAL_PROMPT")))
+                if (AgentKnobs.DisableGitPrompt.GetValue(jobContext).AsBoolean())
                 {
                     jobContext.SetVariable("GIT_TERMINAL_PROMPT", "0");
                 }
@@ -324,6 +324,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 }
 
                 await ShutdownQueue(throwOnFailure: false);
+            }
+        }
+
+        public void UpdateMetadata(JobMetadataMessage message)
+        {
+            if (message.PostLinesFrequencyMillis.HasValue)
+            {
+                _jobServerQueue.UpdateWebConsoleLineRate(message.PostLinesFrequencyMillis.Value);
             }
         }
 

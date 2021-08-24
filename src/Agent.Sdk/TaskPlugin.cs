@@ -16,6 +16,7 @@ using Microsoft.VisualStudio.Services.Content.Common.Telemetry;
 using Microsoft.VisualStudio.Services.WebApi;
 using Newtonsoft.Json;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk.Knob;
 
 namespace Agent.Sdk
 {
@@ -30,9 +31,10 @@ namespace Agent.Sdk
     {
         public static readonly string HasMultipleCheckouts = "HasMultipleCheckouts";
         public static readonly string FirstRepositoryCheckedOut = "FirstRepositoryCheckedOut";
+        public static readonly string WorkspaceIdentifier = "WorkspaceIdentifier";
     }
 
-    public class AgentTaskPluginExecutionContext : ITraceWriter
+    public class AgentTaskPluginExecutionContext : ITraceWriter, IKnobValueContext
     {
         private VssConnection _connection;
         private readonly object _stdoutLock = new object();
@@ -58,7 +60,7 @@ namespace Agent.Sdk
         public Dictionary<string, VariableValue> Variables { get; set; }
         public Dictionary<string, VariableValue> TaskVariables { get; set; }
         public Dictionary<string, string> Inputs { get; set; }
-        public ContainerInfo Container {get; set; }
+        public ContainerInfo Container { get; set; }
         public Dictionary<string, string> JobSettings { get; set; }
 
         [JsonIgnore]
@@ -155,7 +157,7 @@ namespace Agent.Sdk
 #if DEBUG
             Debug(message);
 #else
-            string vstsAgentTrace = Environment.GetEnvironmentVariable("VSTSAGENT_TRACE");
+            string vstsAgentTrace = AgentKnobs.TraceVerbose.GetValue(UtilKnobValueContext.Instance()).AsString();
             if (!string.IsNullOrEmpty(vstsAgentTrace))
             {
                 Debug(message);
@@ -191,6 +193,15 @@ namespace Agent.Sdk
             Output($"##vso[telemetry.publish area={area};feature={feature}]{Escape(propertiesAsJson)}");
         }
 
+        public void PublishTelemetry(string area, string feature, Dictionary<string, object> properties)
+        {
+            ArgUtil.NotNull(area, nameof(area));
+            ArgUtil.NotNull(feature, nameof(feature));
+            ArgUtil.NotNull(properties, nameof(properties));
+            string propertiesAsJson = StringUtil.ConvertToJson(properties, Formatting.None);
+            Output($"##vso[telemetry.publish area={area};feature={feature}]{Escape(propertiesAsJson)}");
+        }
+
         public void PublishTelemetry(string area, string feature, TelemetryRecord record)
             => PublishTelemetry(area, feature, record?.GetAssignedProperties());
 
@@ -208,6 +219,15 @@ namespace Agent.Sdk
                     _trace.Info(message);
                 }
             }
+        }
+
+        public bool IsSystemDebugTrue()
+        {
+            if (Variables.TryGetValue("system.debug", out VariableValue systemDebugVar))
+            {
+                return string.Equals(systemDebugVar?.Value, "true", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
         }
 
         public void PrependPath(string directory)
@@ -314,6 +334,21 @@ namespace Agent.Sdk
                     WebProxy = new AgentWebProxy(proxyUrl, proxyUsername, proxyPassword, proxyBypassHosts)
                 };
             }
+            // back-compat of proxy configuration via environment variables
+            else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY")))
+            {
+                var ProxyUrl = Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY");
+                ProxyUrl = ProxyUrl.Trim();
+                var ProxyUsername = Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY_USERNAME");
+                var ProxyPassword = Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY_PASSWORD");
+                return new AgentWebProxySettings()
+                {
+                    ProxyAddress = ProxyUrl,
+                    ProxyUsername = ProxyUsername,
+                    ProxyPassword = ProxyPassword,
+                    WebProxy = new AgentWebProxy(proxyUrl, ProxyUsername, ProxyPassword, null)
+                };
+            }
             else
             {
                 return null;
@@ -322,28 +357,20 @@ namespace Agent.Sdk
 
         private string Escape(string input)
         {
-            foreach (var mapping in _commandEscapeMappings)
-            {
-                input = input.Replace(mapping.Key, mapping.Value);
-            }
+            var unescapePercents = AgentKnobs.DecodePercents.GetValue(this).AsBoolean();
+            var escaped = CommandStringConvertor.Escape(input, unescapePercents);
 
-            return input;
+            return escaped;
         }
 
-        private Dictionary<string, string> _commandEscapeMappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        string IKnobValueContext.GetVariableValueOrDefault(string variableName)
         {
-            {
-                ";", "%3B"
-            },
-            {
-                "\r", "%0D"
-            },
-            {
-                "\n", "%0A"
-            },
-            {
-                "]", "%5D"
-            },
-        };
+            return Variables.GetValueOrDefault(variableName)?.Value;
+        }
+
+        IScopedEnvironment IKnobValueContext.GetScopedEnvironment()
+        {
+            return new SystemEnvironment();
+        }
     }
 }

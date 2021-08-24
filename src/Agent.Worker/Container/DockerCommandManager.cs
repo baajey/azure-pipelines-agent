@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -34,6 +35,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
         Task<int> DockerExec(IExecutionContext context, string containerId, string options, string command, List<string> outputs);
         Task<string> DockerInspect(IExecutionContext context, string dockerObject, string options);
         Task<List<PortMapping>> DockerPort(IExecutionContext context, string containerId);
+        Task<bool> IsContainerRunning(IExecutionContext context, string containerId);
     }
 
     public class DockerCommandManager : AgentService, IDockerCommandManager
@@ -41,6 +43,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
         public string DockerPath { get; private set; }
 
         public string DockerInstanceLabel { get; private set; }
+        private static UtilKnobValueContext _knobContext = UtilKnobValueContext.Instance();
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -221,14 +224,21 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
         {
             ArgUtil.NotNull(context, nameof(context));
             ArgUtil.NotNull(network, nameof(network));
-
             var usingWindowsContainers = context.Containers.Where(x => x.ExecutionOS != PlatformUtil.OS.Windows).Count() == 0;
             var networkDrivers = await ExecuteDockerCommandAsync(context, "info", "-f \"{{range .Plugins.Network}}{{println .}}{{end}}\"");
+            var valueMTU = AgentKnobs.MTUValueForContainerJobs.GetValue(_knobContext).AsString();
+            string optionMTU = "";
+            
+            if (!String.IsNullOrEmpty(valueMTU)) {
+                optionMTU = $"-o \"com.docker.network.driver.mtu={valueMTU}\"";
+            }   
+
             if (usingWindowsContainers && networkDrivers.Contains("nat"))
             {
-                return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network} --driver nat", context.CancellationToken);
+                return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network} {optionMTU} --driver nat", context.CancellationToken);
             }
-            return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network}", context.CancellationToken);
+
+            return await ExecuteDockerCommandAsync(context, "network", $"create --label {DockerInstanceLabel} {network} {optionMTU}", context.CancellationToken);
         }
 
         public async Task<int> DockerNetworkRemove(IExecutionContext context, string network)
@@ -306,6 +316,26 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Container
         {
             List<string> portMappingLines = await ExecuteDockerCommandAsync(context, "port", containerId);
             return DockerUtil.ParseDockerPort(portMappingLines);
+        }
+
+        /// <summary>
+        /// Checks if container with specified id is running
+        /// </summary>
+        /// <param name="context">Current execution context</param>
+        /// <param name="containerId">String representing container id</param>
+        /// <returns
+        /// <c>true</c>, if specified container is running, <c>false</c> otherwise. 
+        /// </returns>
+        public async Task<bool> IsContainerRunning(IExecutionContext context, string containerId) {
+            List<string> filteredItems = await DockerPS(context, $"--filter id={containerId}");
+
+            // docker ps function is returning table with containers in Running state.
+            // This table is adding to the list line by line. The first string in List is always table header.
+            // The second string appeared only if container by specified id was found and in Running state.
+            // Therefore, we assume that the container is running if the list contains two elements.
+            var isContainerRunning = (filteredItems.Count == 2);
+
+            return isContainerRunning;
         }
 
         private Task<int> ExecuteDockerCommandAsync(IExecutionContext context, string command, string options, CancellationToken cancellationToken = default(CancellationToken))
