@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Collections.Concurrent;
@@ -16,20 +17,26 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Diagnostics.Tracing;
-using Microsoft.TeamFoundation.DistributedTask.Logging;
 using System.Net.Http.Headers;
+using Agent.Sdk.SecretMasking;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk.Util;
+using Microsoft.TeamFoundation.DistributedTask.Logging;
+using SecretMasker = Agent.Sdk.SecretMasking.SecretMasker;
+using LegacySecretMasker = Microsoft.TeamFoundation.DistributedTask.Logging.SecretMasker;
+using Agent.Sdk.Util.SecretMasking;
 
 namespace Microsoft.VisualStudio.Services.Agent
 {
-    public interface IHostContext : IDisposable
+    public interface IHostContext : IDisposable, IKnobValueContext
     {
         StartupType StartupType { get; set; }
         CancellationToken AgentShutdownToken { get; }
         ShutdownReason AgentShutdownReason { get; }
-        ISecretMasker SecretMasker { get; }
+        ILoggedSecretMasker SecretMasker { get; }
         ProductInfoHeaderValue UserAgent { get; }
         string GetDirectory(WellKnownDirectory directory);
+        string GetDiagDirectory(HostType hostType = HostType.Undefined);
         string GetConfigFile(WellKnownConfigFile configFile);
         Tracing GetTrace(string name);
         Task Delay(TimeSpan delay, CancellationToken cancellationToken);
@@ -49,29 +56,23 @@ namespace Microsoft.VisualStudio.Services.Agent
         AutoStartup
     }
 
+    public enum HostType
+    {
+        Undefined, // Default value, used when getting the current hostContext type
+        Worker,
+        Agent
+    }
+
     public class HostContext : EventListener, IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object>>, IHostContext
     {
         private const int _defaultLogPageSize = 8;  //MB
-
-        // URLs can contain secrets if they have a userinfo part
-        // in the authority. example: https://user:pass@example.com
-        // (see https://tools.ietf.org/html/rfc3986#section-3.2)
-        // This regex will help filter those out of the output.
-        // It uses a zero-width positive lookbehind to find the scheme,
-        // the user, and the ":" and skip them. Similarly, it uses
-        // a zero-width positive lookahead to find the "@".
-        // It only matches on the password part.
-        private const string _urlSecretMaskerPattern
-            = "(?<=//[^:/?#\\n]+:)" // lookbehind
-            + "[^@\n]+"             // actual match
-            + "(?=@)";              // lookahead
 
         private static int _defaultLogRetentionDays = 30;
         private static int[] _vssHttpMethodEventIds = new int[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 24 };
         private static int[] _vssHttpCredentialEventIds = new int[] { 11, 13, 14, 15, 16, 17, 18, 20, 21, 22, 27, 29 };
         private readonly ConcurrentDictionary<Type, object> _serviceInstances = new ConcurrentDictionary<Type, object>();
         protected readonly ConcurrentDictionary<Type, Type> ServiceTypes = new ConcurrentDictionary<Type, Type>();
-        private readonly ISecretMasker _secretMasker = new SecretMasker();
+        private ILoggedSecretMasker _secretMasker;
         private readonly ProductInfoHeaderValue _userAgent = new ProductInfoHeaderValue($"VstsAgentCore-{BuildConstants.AgentPackage.PackageName}", BuildConstants.AgentPackage.Version);
         private CancellationTokenSource _agentShutdownTokenSource = new CancellationTokenSource();
         private object _perfLock = new object();
@@ -82,46 +83,57 @@ namespace Microsoft.VisualStudio.Services.Agent
         private AssemblyLoadContext _loadContext;
         private IDisposable _httpTraceSubscription;
         private IDisposable _diagListenerSubscription;
+        private LegacySecretMasker _legacySecretMasker = new LegacySecretMasker();
+        private SecretMasker _newSecretMasker = new SecretMasker();
         private StartupType _startupType;
         private string _perfFile;
+        private HostType _hostType;
         public event EventHandler Unloading;
         public CancellationToken AgentShutdownToken => _agentShutdownTokenSource.Token;
         public ShutdownReason AgentShutdownReason { get; private set; }
-        public ISecretMasker SecretMasker => _secretMasker;
+        public ILoggedSecretMasker SecretMasker => _secretMasker;
         public ProductInfoHeaderValue UserAgent => _userAgent;
-        public HostContext(string hostType, string logFile = null)
+
+        public HostContext(HostType hostType, string logFile = null)
         {
+            var useNewSecretMasker =  AgentKnobs.EnableNewSecretMasker.GetValue(this).AsBoolean();
+            _secretMasker = useNewSecretMasker ? new LoggedSecretMasker(_newSecretMasker) : new LegacyLoggedSecretMasker(_legacySecretMasker);
             // Validate args.
-            ArgUtil.NotNullOrEmpty(hostType, nameof(hostType));
+            if (hostType == HostType.Undefined)
+            {
+                throw new ArgumentException(message: $"HostType cannot be {HostType.Undefined}");
+            }
+            _hostType = hostType;
 
             _loadContext = AssemblyLoadContext.GetLoadContext(typeof(HostContext).GetTypeInfo().Assembly);
             _loadContext.Unloading += LoadContext_Unloading;
 
-            this.SecretMasker.AddValueEncoder(ValueEncoders.JsonStringEscape);
-            this.SecretMasker.AddValueEncoder(ValueEncoders.UriDataEscape);
-            this.SecretMasker.AddValueEncoder(ValueEncoders.BackslashEscape);
-            this.SecretMasker.AddRegex(_urlSecretMaskerPattern);
+            this.SecretMasker.AddValueEncoder(ValueEncoders.JsonStringEscape, $"HostContext_{WellKnownSecretAliases.JsonStringEscape}");
+            this.SecretMasker.AddValueEncoder(ValueEncoders.UriDataEscape, $"HostContext_{WellKnownSecretAliases.UriDataEscape}");
+            this.SecretMasker.AddValueEncoder(ValueEncoders.BackslashEscape, $"HostContext_{WellKnownSecretAliases.UriDataEscape}");
+            this.SecretMasker.AddRegex(AdditionalMaskingRegexes.UrlSecretPattern, $"HostContext_{WellKnownSecretAliases.UrlSecretPattern}");
 
             // Create the trace manager.
             if (string.IsNullOrEmpty(logFile))
             {
                 int logPageSize;
-                string logSizeEnv = Environment.GetEnvironmentVariable($"{hostType.ToUpperInvariant()}_LOGSIZE");
+                string logSizeEnv = Environment.GetEnvironmentVariable($"{_hostType.ToString().ToUpperInvariant()}_LOGSIZE");
                 if (!string.IsNullOrEmpty(logSizeEnv) || !int.TryParse(logSizeEnv, out logPageSize))
                 {
                     logPageSize = _defaultLogPageSize;
                 }
 
                 int logRetentionDays;
-                string logRetentionDaysEnv = Environment.GetEnvironmentVariable($"{hostType.ToUpperInvariant()}_LOGRETENTION");
+                string logRetentionDaysEnv = Environment.GetEnvironmentVariable($"{_hostType.ToString().ToUpperInvariant()}_LOGRETENTION");
                 if (!string.IsNullOrEmpty(logRetentionDaysEnv) || !int.TryParse(logRetentionDaysEnv, out logRetentionDays))
                 {
                     logRetentionDays = _defaultLogRetentionDays;
                 }
 
-                // this should give us _diag folder under agent root directory
-                string diagLogDirectory = Path.Combine(new DirectoryInfo(Path.GetDirectoryName(Assembly.GetEntryAssembly().Location)).Parent.FullName, Constants.Path.DiagDirectory);
-                _traceManager = new TraceManager(new HostTraceListener(diagLogDirectory, hostType, logPageSize, logRetentionDays), this.SecretMasker);
+                // this should give us _diag folder under agent root directory as default value for diagLogDirctory
+                string diagLogPath = GetDiagDirectory(_hostType);
+                _traceManager = new TraceManager(new HostTraceListener(diagLogPath, hostType.ToString(), logPageSize, logRetentionDays), this.SecretMasker);
+
             }
             else
             {
@@ -129,11 +141,12 @@ namespace Microsoft.VisualStudio.Services.Agent
             }
 
             _trace = GetTrace(nameof(HostContext));
+            this.SecretMasker.SetTrace(_trace);
+
             _vssTrace = GetTrace(nameof(VisualStudio) + nameof(VisualStudio.Services));  // VisualStudioService
 
             // Enable Http trace
-            bool enableHttpTrace;
-            if (bool.TryParse(Environment.GetEnvironmentVariable("VSTS_AGENT_HTTPTRACE"), out enableHttpTrace) && enableHttpTrace)
+            if (AgentKnobs.HttpTrace.GetValue(this).AsBoolean())
             {
                 _trace.Warning("*****************************************************************************************");
                 _trace.Warning("**                                                                                     **");
@@ -147,7 +160,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             }
 
             // Enable perf counter trace
-            string perfCounterLocation = Environment.GetEnvironmentVariable("VSTS_AGENT_PERFLOG");
+            string perfCounterLocation = AgentKnobs.AgentPerflog.GetValue(this).AsString();
             if (!string.IsNullOrEmpty(perfCounterLocation))
             {
                 try
@@ -171,12 +184,6 @@ namespace Microsoft.VisualStudio.Services.Agent
                     path = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
                     break;
 
-                case WellKnownDirectory.Diag:
-                    path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
-                        Constants.Path.DiagDirectory);
-                    break;
-
                 case WellKnownDirectory.Externals:
                     path = Path.Combine(
                         GetDirectory(WellKnownDirectory.Root),
@@ -189,6 +196,12 @@ namespace Microsoft.VisualStudio.Services.Agent
                         Constants.Path.LegacyPSHostDirectory);
                     break;
 
+                case WellKnownDirectory.LegacyPSHostLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.LegacyPSHostLegacyDirectory);
+                    break;
+
                 case WellKnownDirectory.Root:
                     path = new DirectoryInfo(GetDirectory(WellKnownDirectory.Bin)).Parent.FullName;
                     break;
@@ -199,10 +212,22 @@ namespace Microsoft.VisualStudio.Services.Agent
                         Constants.Path.ServerOMDirectory);
                     break;
 
+                case WellKnownDirectory.ServerOMLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.ServerOMLegacyDirectory);
+                    break;
+
                 case WellKnownDirectory.Tf:
                     path = Path.Combine(
                         GetDirectory(WellKnownDirectory.Externals),
                         Constants.Path.TfDirectory);
+                    break;
+
+                case WellKnownDirectory.TfLegacy:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Externals),
+                        Constants.Path.TfLegacyDirectory);
                     break;
 
                 case WellKnownDirectory.Tee:
@@ -230,7 +255,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     break;
 
                 case WellKnownDirectory.Tools:
-                    path = Environment.GetEnvironmentVariable("AGENT_TOOLSDIRECTORY") ?? Environment.GetEnvironmentVariable(Constants.Variables.Agent.ToolsDirectory);
+                    path = AgentKnobs.AgentToolsDirectory.GetValue(this).AsString();
                     if (string.IsNullOrEmpty(path))
                     {
                         path = Path.Combine(
@@ -261,6 +286,29 @@ namespace Microsoft.VisualStudio.Services.Agent
 
             _trace.Info($"Well known directory '{directory}': '{path}'");
             return path;
+        }
+
+        public string GetDiagDirectory(HostType hostType = HostType.Undefined)
+        {
+            return hostType switch
+            {
+                HostType.Undefined => GetDiagDirectory(_hostType),
+                HostType.Agent => GetDiagOrDefault(AgentKnobs.AgentDiagLogPath.GetValue(this).AsString()),
+                HostType.Worker => GetDiagOrDefault(AgentKnobs.WorkerDiagLogPath.GetValue(this).AsString()),
+                _ => throw new NotSupportedException($"Unexpected host type: '{hostType}'"),
+            };
+        }
+
+        private string GetDiagOrDefault(string diagFolder)
+        {
+            if (!string.IsNullOrEmpty(diagFolder))
+            {
+                return diagFolder;
+            }
+
+            return Path.Combine(
+                new DirectoryInfo(Path.GetDirectoryName(Assembly.GetEntryAssembly().Location)).Parent.FullName,
+                Constants.Path.DiagDirectory);
         }
 
         public string GetConfigFile(WellKnownConfigFile configFile)
@@ -342,6 +390,20 @@ namespace Microsoft.VisualStudio.Services.Agent
                         GetDirectory(WellKnownDirectory.Root),
                         ".options");
                     break;
+
+                case WellKnownConfigFile.SetupInfo:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Root),
+                        ".setup_info");
+                    break;
+
+                // We need to remove this config file - once Node 6 handler is dropped
+                case WellKnownConfigFile.TaskExceptionList:
+                    path = Path.Combine(
+                        GetDirectory(WellKnownDirectory.Bin),
+                        "tasks-exception-list.json");
+                    break;
+
                 default:
                     throw new NotSupportedException($"Unexpected well known config file: '{configFile}'");
             }
@@ -447,7 +509,6 @@ namespace Microsoft.VisualStudio.Services.Agent
             CultureInfo.DefaultThreadCurrentUICulture = new CultureInfo(name);
         }
 
-
         public void ShutdownAgent(ShutdownReason reason)
         {
             ArgUtil.NotNull(reason, nameof(reason));
@@ -521,6 +582,16 @@ namespace Microsoft.VisualStudio.Services.Agent
             }
         }
 
+        string IKnobValueContext.GetVariableValueOrDefault(string variableName)
+        {
+            throw new NotSupportedException("Method not supported for Microsoft.VisualStudio.Services.Agent.HostContext");
+        }
+
+        IScopedEnvironment IKnobValueContext.GetScopedEnvironment()
+        {
+            return new SystemEnvironment();
+        }
+
         protected virtual void Dispose(bool disposing)
         {
             // TODO: Dispose the trace listener also.
@@ -541,6 +612,10 @@ namespace Microsoft.VisualStudio.Services.Agent
                 _trace = null;
                 _httpTrace?.Dispose();
                 _httpTrace = null;
+                _legacySecretMasker?.Dispose();
+                _legacySecretMasker = null;
+                _newSecretMasker?.Dispose();
+                _newSecretMasker = null;
 
                 _agentShutdownTokenSource?.Dispose();
                 _agentShutdownTokenSource = null;
@@ -601,7 +676,7 @@ namespace Microsoft.VisualStudio.Services.Agent
 
         protected override void OnEventWritten(EventWrittenEventArgs eventData)
         {
-            if (eventData == null)
+            if (eventData == null || string.IsNullOrEmpty(eventData.Message))
             {
                 return;
             }
@@ -676,7 +751,23 @@ namespace Microsoft.VisualStudio.Services.Agent
             HttpClientHandler clientHandler = new HttpClientHandler();
             var agentWebProxy = context.GetService<IVstsAgentWebProxy>();
             clientHandler.Proxy = agentWebProxy.WebProxy;
+
+            var agentCertManager = context.GetService<IAgentCertificateManager>();
+            if (agentCertManager.SkipServerCertificateValidation)
+            {
+                clientHandler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
+
             return clientHandler;
+        }
+
+        public static void AddAdditionalMaskingRegexes(this IHostContext context)
+        {
+            ArgUtil.NotNull(context, nameof(context));
+            foreach (var pattern in AdditionalMaskingRegexes.CredScanPatterns)
+            {
+                context.SecretMasker.AddRegex(pattern, $"HostContext_{WellKnownSecretAliases.CredScanPatterns}");
+            }
         }
     }
 

@@ -9,9 +9,11 @@ using System.Collections.Generic;
 using System.Linq;
 using Agent.Listener.CommandLine;
 using Agent.Sdk;
+using Agent.Sdk.Util;
 using CommandLine;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json;
+using System.Runtime.Versioning;
 
 namespace Microsoft.VisualStudio.Services.Agent.Listener
 {
@@ -28,6 +30,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             typeof(RunAgent),
             typeof(RemoveAgent),
             typeof(WarmupAgent),
+            typeof(ReAuthAgent),
         };
 
         private string[] verbCommands = new string[]
@@ -36,6 +39,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             Constants.Agent.CommandLine.Commands.Remove,
             Constants.Agent.CommandLine.Commands.Run,
             Constants.Agent.CommandLine.Commands.Warmup,
+            Constants.Agent.CommandLine.Commands.ReAuth,
         };
 
 
@@ -44,6 +48,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         private RemoveAgent Remove { get; set; }
         private RunAgent Run { get; set; }
         private WarmupAgent Warmup { get; set; }
+        private ReAuthAgent ReAuth { get; set; }
 
         public IEnumerable<Error> ParseErrors { get; set; }
 
@@ -65,24 +70,35 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             // Mask secret arguments
             if (Configure != null)
             {
-                context.SecretMasker.AddValue(Configure.Password);
-                context.SecretMasker.AddValue(Configure.ProxyPassword);
-                context.SecretMasker.AddValue(Configure.SslClientCert);
-                context.SecretMasker.AddValue(Configure.Token);
-                context.SecretMasker.AddValue(Configure.WindowsLogonPassword);
+                context.SecretMasker.AddValue(Configure.Password, WellKnownSecretAliases.ConfigurePassword);
+                context.SecretMasker.AddValue(Configure.ProxyPassword, WellKnownSecretAliases.ConfigureProxyPassword);
+                context.SecretMasker.AddValue(Configure.SslClientCert, WellKnownSecretAliases.ConfigureSslClientCert);
+                context.SecretMasker.AddValue(Configure.Token, WellKnownSecretAliases.ConfigureToken);
+                context.SecretMasker.AddValue(Configure.WindowsLogonPassword, WellKnownSecretAliases.ConfigureWindowsLogonPassword);
+                context.SecretMasker.AddValue(Configure.TenantId, WellKnownSecretAliases.ConfigureTenantId);
+                context.SecretMasker.AddValue(Configure.ClientId, WellKnownSecretAliases.ConfigureClientId);
+                context.SecretMasker.AddValue(Configure.ClientSecret, WellKnownSecretAliases.ConfigureClientSecret);
             }
 
             if (Remove != null)
             {
-                context.SecretMasker.AddValue(Remove.Password);
-                context.SecretMasker.AddValue(Remove.Token);
+                context.SecretMasker.AddValue(Remove.Password, WellKnownSecretAliases.RemovePassword);
+                context.SecretMasker.AddValue(Remove.Token, WellKnownSecretAliases.RemoveToken);
+                context.SecretMasker.AddValue(Remove.TenantId, WellKnownSecretAliases.RemoveTenantId);
+                context.SecretMasker.AddValue(Remove.ClientId, WellKnownSecretAliases.RemoveClientId);
+                context.SecretMasker.AddValue(Remove.ClientSecret, WellKnownSecretAliases.RemoveClientSecret);
+            }
+
+            if (ReAuth != null)
+            {
+                context.SecretMasker.AddValue(ReAuth.Token, WellKnownSecretAliases.RemoveToken);
             }
 
             PrintArguments();
 
             // Store and remove any args passed via environment variables.
             var environment = environmentScope.GetEnvironmentVariables();
-            
+
             string envPrefix = "VSTS_AGENT_INPUT_";
             foreach (DictionaryEntry entry in environment)
             {
@@ -100,7 +116,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                         bool secret = Constants.Agent.CommandLine.Args.Secrets.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
                         if (secret)
                         {
-                            context.SecretMasker.AddValue(val);
+                            context.SecretMasker.AddValue(val, $"CommandSettings_{fullKey}");
                         }
 
                         // Store the value.
@@ -126,6 +142,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 defaultValue: false);
         }
 
+        public bool GetAlwaysExtractTask()
+        {
+            return TestFlag(Configure?.AlwaysExtractTask, Constants.Agent.CommandLine.Flags.AlwaysExtractTask);
+        }
+
         public bool GetReplace()
         {
             return TestFlagOrPrompt(
@@ -142,6 +163,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 name: Constants.Agent.CommandLine.Flags.RunAsService,
                 description: StringUtil.Loc("RunAgentAsServiceDescription"),
                 defaultValue: false);
+        }
+
+        public bool GetPreventServiceStart()
+        {
+            return TestFlagOrPrompt(
+                value: Configure?.PreventServiceStart,
+                name: Constants.Agent.CommandLine.Flags.PreventServiceStart,
+                description: StringUtil.Loc("PreventServiceStartDescription"),
+                defaultValue: false
+            );
         }
 
         public bool GetRunAsAutoLogon()
@@ -188,6 +219,49 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 name: Constants.Agent.CommandLine.Flags.LaunchBrowser,
                 description: StringUtil.Loc("LaunchBrowser"),
                 defaultValue: true);
+        }
+
+        public string GetClientId()
+        {
+            return GetArgOrPrompt(
+                argValue: GetConfigureOrRemoveBase()?.ClientId,
+                name: Constants.Agent.CommandLine.Args.ClientId,
+                description: StringUtil.Loc("ClientId"),
+                defaultValue: string.Empty,
+                validator: Validators.NonEmptyValidator);
+        }
+
+        public string GetClientSecret()
+        {
+            return GetArgOrPrompt(
+                argValue: GetConfigureOrRemoveBase()?.ClientSecret,
+                name: Constants.Agent.CommandLine.Args.ClientSecret,
+                description: StringUtil.Loc("ClientSecret"),
+                defaultValue: string.Empty,
+                validator: Validators.NonEmptyValidator);
+        }
+
+        public string GetTenantId()
+        {
+            return GetArgOrPrompt(
+                argValue: GetConfigureOrRemoveBase()?.TenantId,
+                name: Constants.Agent.CommandLine.Args.TenantId,
+                description: StringUtil.Loc("TenantId"),
+                defaultValue: string.Empty,
+                validator: Validators.NonEmptyValidator);
+        }
+
+        /// <summary>
+        /// Returns EnableServiceSidTypeUnrestricted flag or prompts user to set it up
+        /// </summary>
+        /// <returns>Parameter value</returns>
+        public bool GetEnableServiceSidTypeUnrestricted()
+        {
+            return TestFlagOrPrompt(
+                value: Configure?.EnableServiceSidTypeUnrestricted,
+                name: Constants.Agent.CommandLine.Flags.EnableServiceSidTypeUnrestricted,
+                description: StringUtil.Loc("EnableServiceSidTypeUnrestricted"),
+                defaultValue: false);
         }
         //
         // Args.
@@ -371,6 +445,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 validator: Validators.NonEmptyValidator);
         }
 
+        [SupportedOSPlatform("windows")]
         public string GetWindowsLogonAccount(string defaultValue, string descriptionMsg)
         {
             return GetArgOrPrompt(
@@ -419,9 +494,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         // This is used to find out the source from where the agent.listener.exe was launched at the time of run
         public string GetStartupType()
         {
-            return GetArg(Configure?.StartupType, Constants.Agent.CommandLine.Args.StartupType);
+            return GetArg(Run?.StartupType, Constants.Agent.CommandLine.Args.StartupType);
         }
-        
+
         public string GetProxyUrl()
         {
             return GetArg(Configure?.ProxyUrl, Constants.Agent.CommandLine.Args.ProxyUrl);
@@ -439,7 +514,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
         public bool GetSkipCertificateValidation()
         {
-            return TestFlag(Configure?.SslSkipCertValidation , Constants.Agent.CommandLine.Flags.SslSkipCertValidation);
+            return TestFlag(Configure?.SslSkipCertValidation, Constants.Agent.CommandLine.Flags.SslSkipCertValidation);
         }
 
         public string GetCACertificate()
@@ -479,7 +554,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
         public bool GetRunOnce()
         {
-            return TestFlag(Run?.RunOnce, Constants.Agent.CommandLine.Flags.Once);
+            return TestFlag(Configure?.RunOnce, Constants.Agent.CommandLine.Flags.Once) ||
+                   TestFlag(Run?.RunOnce, Constants.Agent.CommandLine.Flags.Once);
+        }
+
+        public bool GetDebugMode()
+        {
+            return TestFlag(Run?.DebugMode, Constants.Agent.CommandLine.Flags.DebugMode);
         }
 
         public bool GetDeploymentPool()
@@ -489,13 +570,23 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
         public bool GetDeploymentOrMachineGroup()
         {
-            if (TestFlag(Configure?.DeploymentGroup, Constants.Agent.CommandLine.Flags.DeploymentGroup) || 
+            if (TestFlag(Configure?.DeploymentGroup, Constants.Agent.CommandLine.Flags.DeploymentGroup) ||
                 (Configure?.MachineGroup == true))
             {
                 return true;
             }
 
             return false;
+        }
+
+        public bool GetDisableLogUploads()
+        {
+            return TestFlag(Configure?.DisableLogUploads, Constants.Agent.CommandLine.Flags.DisableLogUploads);
+        }
+
+        public bool GetReStreamLogsToFiles()
+        {
+            return TestFlag(Configure?.ReStreamLogsToFiles, Constants.Agent.CommandLine.Flags.ReStreamLogsToFiles);
         }
 
         public bool Unattended()
@@ -526,7 +617,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             if ((Configure?.Version == true) ||
                 (Remove?.Version == true) ||
                 (Run?.Version == true) ||
-                (Warmup?.Version == true))
+                (Warmup?.Version == true) ||
+                (ReAuth?.Version == true))
             {
                 return true;
             }
@@ -539,7 +631,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             if ((Configure?.Help == true) ||
                 (Remove?.Help == true) ||
                 (Run?.Help == true) ||
-                (Warmup?.Help == true))
+                (Warmup?.Help == true) ||
+                (ReAuth?.Help == true))
             {
                 return true;
             }
@@ -586,6 +679,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
             return false;
         }
+
+        public bool IsReAuthCommand() => ReAuth != null;
 
 
         //
@@ -724,6 +819,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             {
                 config.AutoHelp = false;
                 config.AutoVersion = false;
+                config.CaseSensitive = false;
 
                 // We should consider making this false, but it will break people adding unknown arguments
                 config.IgnoreUnknownArguments = ignoreErrors;
@@ -755,6 +851,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                         {
                             Warmup = x;
                         })
+                    .WithParsed<ReAuthAgent>(
+                        x =>
+                        {
+                            ReAuth = x;
+                        })
                     .WithNotParsed(
                         errors =>
                         {
@@ -767,12 +868,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         {
             if (Configure != null)
             {
-                _trace.Info(string.Concat(nameof(Configure)," ",ObjectAsJson(Configure)));
+                _trace.Info(string.Concat(nameof(Configure), " ", ObjectAsJson(Configure)));
             }
 
             if (Remove != null)
             {
                 _trace.Info(string.Concat(nameof(Remove), " ", ObjectAsJson(Remove)));
+            }
+
+            if (ReAuth != null)
+            {
+                _trace.Info(string.Concat(nameof(ReAuth), " ", ObjectAsJson(ReAuth)));
             }
 
             if (Warmup != null)
@@ -803,6 +909,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             if (Remove != null)
             {
                 return Remove as ConfigureOrRemoveBase;
+            }
+
+            if (ReAuth != null)
+            {
+                return ReAuth as ConfigureOrRemoveBase;
             }
 
             return null;

@@ -8,6 +8,7 @@ using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Common;
 using System;
 using System.Collections.Generic;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Security.Cryptography;
@@ -16,6 +17,7 @@ using System.Text;
 using Microsoft.VisualStudio.Services.OAuth;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Agent.Sdk.Util;
 
 namespace Microsoft.VisualStudio.Services.Agent.Listener
 {
@@ -25,6 +27,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
         Task<Boolean> CreateSessionAsync(CancellationToken token);
         Task DeleteSessionAsync();
         Task<TaskAgentMessage> GetNextMessageAsync(CancellationToken token);
+        Task KeepAlive(CancellationToken token);
         Task DeleteMessageAsync(TaskAgentMessage message);
     }
 
@@ -115,6 +118,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 catch (TaskAgentAccessTokenExpiredException)
                 {
                     Trace.Info("Agent OAuth token has been revoked. Session creation failed.");
+                    throw;
+                }
+                catch (SocketException ex)
+                {
+                    ExceptionsUtil.HandleSocketException(ex, serverUrl, Trace.Error);
                     throw;
                 }
                 catch (Exception ex)
@@ -254,6 +262,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                         Trace.Verbose($"No message retrieved from session '{_session.SessionId}'.");
                     }
 
+                    _getNextMessageRetryInterval = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15), _getNextMessageRetryInterval);
+                    Trace.Info("Sleeping for {0} seconds before retrying.", _getNextMessageRetryInterval.TotalSeconds);
+                    await HostContext.Delay(_getNextMessageRetryInterval, token);
                     continue;
                 }
 
@@ -276,6 +287,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             }
         }
 
+        public async Task KeepAlive(CancellationToken token)
+        {
+           
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await _agentServer.GetAgentMessageAsync(_settings.PoolId, _session.SessionId, null, token);
+                    Trace.Info($"Sent GetAgentMessage to keep alive agent {_settings.AgentId}, session '{_session.SessionId}'.");
+                }
+                catch (Exception ex)
+                {
+                    Trace.Verbose("Unable to sent GetAgentMessage to keep alive", ex.Message);
+                }
+
+                await HostContext.Delay(TimeSpan.FromSeconds(30), token);
+            }
+        }
         private TaskAgentMessage DecryptMessage(TaskAgentMessage message)
         {
             if (_session.EncryptionKey == null ||

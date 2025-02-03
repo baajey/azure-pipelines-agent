@@ -18,6 +18,9 @@ namespace Agent.Listener.CommandLine
         [Option(Constants.Agent.CommandLine.Flags.AddMachineGroupTags)]
         public bool AddMachineGroupTags { get; set; }
 
+        [Option(Constants.Agent.CommandLine.Flags.AlwaysExtractTask)]
+        public bool AlwaysExtractTask { get; set; }
+
         [Option(Constants.Agent.CommandLine.Args.Agent)]
         public string Agent { get; set; }
 
@@ -39,6 +42,9 @@ namespace Agent.Listener.CommandLine
         [Option(Constants.Agent.CommandLine.Args.DeploymentPoolName)]
         public string DeploymentPoolName { get; set; }
 
+        [Option(Constants.Agent.CommandLine.Flags.EnableServiceSidTypeUnrestricted)]
+        public bool EnableServiceSidTypeUnrestricted { get; set; }
+
         [Option(Constants.Agent.CommandLine.Flags.Environment)]
         public bool EnvironmentVMResource { get; set; }
 
@@ -50,6 +56,12 @@ namespace Agent.Listener.CommandLine
 
         [Option(Constants.Agent.CommandLine.Flags.GitUseSChannel)]
         public bool GitUseSChannel { get; set; }
+
+        [Option(Constants.Agent.CommandLine.Flags.DisableLogUploads)]
+        public bool DisableLogUploads { get; set; }
+
+        [Option(Constants.Agent.CommandLine.Flags.ReStreamLogsToFiles)]
+        public bool ReStreamLogsToFiles { get; set; }
 
         [Option(Constants.Agent.CommandLine.Flags.MachineGroup)]
         public bool MachineGroup { get; set; }
@@ -99,6 +111,12 @@ namespace Agent.Listener.CommandLine
         [Option(Constants.Agent.CommandLine.Flags.RunAsService)]
         public bool RunAsService { get; set; }
 
+        [Option(Constants.Agent.CommandLine.Flags.Once)]
+        public bool RunOnce { get; set; }
+
+        [Option(Constants.Agent.CommandLine.Flags.PreventServiceStart)]
+        public bool PreventServiceStart { get; set; }
+
         [Option(Constants.Agent.CommandLine.Args.SslCACert)]
         public string SslCACert { get; set; }
 
@@ -117,9 +135,6 @@ namespace Agent.Listener.CommandLine
         [Option(Constants.Agent.CommandLine.Flags.SslSkipCertValidation)]
         public bool SslSkipCertValidation { get; set; }
 
-        [Option(Constants.Agent.CommandLine.Args.StartupType)]
-        public string StartupType { get; set; }
-
         [Option(Constants.Agent.CommandLine.Args.Url)]
         public string Url { get; set; }
 
@@ -130,6 +145,6 @@ namespace Agent.Listener.CommandLine
         public string WindowsLogonPassword { get; set; }
 
         [Option(Constants.Agent.CommandLine.Args.Work)]
-        public string Work { get; set; }        
+        public string Work { get; set; }
     }
 }

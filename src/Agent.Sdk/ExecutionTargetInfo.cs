@@ -3,10 +3,12 @@
 
 namespace Agent.Sdk
 {
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1715: Identifiers should have correct prefix")]
     public interface ExecutionTargetInfo
     {
         PlatformUtil.OS ExecutionOS { get; }
         string CustomNodePath { get; set; }
+        string ResultNodePath { get; set; }
 
         string TranslateContainerPathForImageOS(PlatformUtil.OS runningOs, string path);
         string TranslateToContainerPath(string path);
@@ -17,6 +19,7 @@ namespace Agent.Sdk
     {
         public PlatformUtil.OS ExecutionOS => PlatformUtil.HostOS;
         public string CustomNodePath { get; set; }
+        public string ResultNodePath { get; set; }
 
         public string TranslateToContainerPath(string path)
         {

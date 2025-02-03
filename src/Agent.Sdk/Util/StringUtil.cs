@@ -11,6 +11,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Microsoft.VisualStudio.Services.Agent.Util
 {
@@ -74,6 +75,38 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
+        /// <summary>
+        /// Convert String to boolean, valid true string: "1", "true", "$true", valid false string: "0", "false", "$false".
+        /// </summary>
+        /// <param name="value">Input value to convert.</param>
+        /// <returns>Boolean representing parsed value</returns>
+        /// <exception cref="ArgumentNullException"></exception>
+        /// <exception cref="FormatException"></exception>
+        public static bool ConvertToBooleanStrict(string value)
+        {
+            if (value is null)
+            {
+                throw new ArgumentNullException("Passed value can not be null.");
+            }
+
+            switch (value.ToLowerInvariant())
+            {
+                case "1":
+                case "true":
+                case "$true":
+                    return true;
+
+                case "0":
+                case "false":
+                case "$false":
+                    return false;
+
+                default:
+                    throw new FormatException("Argument not matches boolean patterns.");
+            }
+        }
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1720: Identifiers should not contain type")]
         public static string ConvertToJson(object obj, Formatting formatting = Formatting.Indented)
         {
             return JsonConvert.SerializeObject(obj, formatting, s_serializerSettings.Value);
@@ -231,6 +264,34 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 // Store the instance.
                 s_locStrings = locStrings;
             }
+        }
+
+        public static string HashNormalizer(string hash)
+        {
+            // Reducing the hash to the lower case without hyphens.
+            // For example: from "A1-B2-C3-D4-E5-F6", we get "a1b2c3d5f6".
+            return String.Join("", hash.Split("-")).ToLower();
+        }
+
+        public static bool AreHashesEqual(string leftValue, string rightValue)
+        {
+            // Compare hashes.
+            // For example: "A1-B2-C3-D4-E5-F6" and "a1b2c3d5f6" are the same hash.
+            return HashNormalizer(leftValue) == HashNormalizer(rightValue);
+        }
+
+        /// <summary>
+        /// Finds all vso commands in the line and deactivates them
+        /// </summary>
+        /// <returns>String without vso commands that can be executed</returns>
+        public static string DeactivateVsoCommands(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+            {
+                return string.Empty;
+            }
+
+            return Regex.Replace(input, "##vso", "**vso", RegexOptions.IgnoreCase);
         }
     }
 }

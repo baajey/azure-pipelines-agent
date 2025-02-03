@@ -10,6 +10,9 @@ using System.Text;
 using Agent.Sdk;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
+using System.IO;
+using Agent.Sdk.Knob;
+using System.Linq;
 
 namespace Agent.Plugins.Repository
 {
@@ -30,7 +33,7 @@ namespace Agent.Plugins.Repository
         public abstract Task<bool> TryWorkspaceDeleteAsync(ITfsVCWorkspace workspace);
         public abstract Task WorkspacesRemoveAsync(ITfsVCWorkspace workspace);
 
-        protected virtual Encoding OutputEncoding => null;
+        protected virtual Encoding OutputEncoding => Encoding.UTF8;
 
         protected string SourceVersion
         {
@@ -66,15 +69,57 @@ namespace Agent.Plugins.Repository
 
         protected Task RunCommandAsync(params string[] args)
         {
-            return RunCommandAsync(FormatFlags.None, args);
+            return RunCommandAsync(FormatTags.None, args);
         }
 
-        protected Task RunCommandAsync(FormatFlags formatFlags, params string[] args)
+        protected Task RunCommandAsync(int retriesOnFailure, params string[] args)
+        {
+            return RunCommandAsync(FormatTags.None, false, retriesOnFailure, args);
+        }
+
+        protected Task RunCommandAsync(FormatTags formatFlags, params string[] args)
         {
             return RunCommandAsync(formatFlags, false, args);
         }
 
-        protected async Task RunCommandAsync(FormatFlags formatFlags, bool quiet, params string[] args)
+        protected Task RunCommandAsync(FormatTags formatFlags, bool quiet, params string[] args)
+        {
+            return RunCommandAsync(formatFlags, quiet, 0, args);
+        }
+
+        protected async Task RunCommandAsync(FormatTags formatFlags, bool quiet, int retriesOnFailure, params string[] args)
+        {
+            for (int attempt = 0; attempt < retriesOnFailure - 1; attempt++)
+            {
+                int exitCode = await RunCommandAsync(formatFlags, quiet, false, args);
+
+                if (exitCode == 0)
+                {
+                    return;
+                }
+
+                int sleep = Math.Min(200 * (int)Math.Pow(5, attempt), 30000);
+                ExecutionContext.Output($"Sleeping for {sleep} ms");
+                await Task.Delay(sleep);
+
+                // Use attempt+2 since we're using 0 based indexing and we're displaying this for the next attempt.
+                ExecutionContext.Output($@"Retrying. Attempt {attempt + 2}/{retriesOnFailure}");
+            }
+
+            // Perform one last try and fail on non-zero exit code
+            await RunCommandAsync(formatFlags, quiet, true, args);
+        }
+
+        private string WriteCommandToFile(string command)
+        {
+            Guid guid = Guid.NewGuid();
+            string temporaryName = $"tfs_cmd_{guid}.txt";
+            using StreamWriter sw = new StreamWriter(Path.Combine(this.SourcesDirectory, temporaryName));
+            sw.WriteLine(command);
+            return temporaryName;
+        }
+
+        protected async Task<int> RunCommandAsync(FormatTags formatFlags, bool quiet, bool failOnNonZeroExitCode, params string[] args)
         {
             // Validation.
             ArgUtil.NotNull(args, nameof(args));
@@ -106,27 +151,62 @@ namespace Agent.Plugins.Repository
                     }
                 };
                 string arguments = FormatArguments(formatFlags, args);
+                bool useSecureParameterPassing = AgentKnobs.TfVCUseSecureParameterPassing.GetValue(ExecutionContext).AsBoolean();
+                string temporaryFileWithCommand = "";
+                if (useSecureParameterPassing)
+                {
+                    temporaryFileWithCommand = WriteCommandToFile(arguments);
+                    arguments = $"@{temporaryFileWithCommand}";
+                    ExecutionContext.Debug($"{AgentKnobs.TfVCUseSecureParameterPassing.Name} is enabled, passing command via file");
+                }
                 ExecutionContext.Command($@"tf {arguments}");
-                await processInvoker.ExecuteAsync(
+
+                var result = await processInvoker.ExecuteAsync(
                     workingDirectory: SourcesDirectory,
                     fileName: "tf",
                     arguments: arguments,
                     environment: AdditionalEnvironmentVariables,
-                    requireExitCodeZero: true,
+                    requireExitCodeZero: failOnNonZeroExitCode,
                     outputEncoding: OutputEncoding,
                     cancellationToken: CancellationToken);
+
+                if (useSecureParameterPassing)
+                {
+                    try
+                    {
+                        await IOUtil.DeleteFileWithRetry(Path.Combine(this.SourcesDirectory, temporaryFileWithCommand), CancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        ExecutionContext.Output($"Unable to delete command file which is used to pass data, ex:{ex.GetType()}");
+                        throw;
+
+                    }
+                }
+
+                return result;
             }
+        }
+
+        protected Task<string> RunPorcelainCommandAsync(FormatTags formatFlags, params string[] args)
+        {
+            return RunPorcelainCommandAsync(formatFlags, 0, args);
         }
 
         protected Task<string> RunPorcelainCommandAsync(params string[] args)
         {
-            return RunPorcelainCommandAsync(FormatFlags.None, args);
+            return RunPorcelainCommandAsync(FormatTags.None, 0, args);
         }
 
-        protected async Task<string> RunPorcelainCommandAsync(FormatFlags formatFlags, params string[] args)
+        protected Task<string> RunPorcelainCommandAsync(int retriesOnFailure, params string[] args)
+        {
+            return RunPorcelainCommandAsync(FormatTags.None, retriesOnFailure, args);
+        }
+
+        protected async Task<string> RunPorcelainCommandAsync(FormatTags formatFlags, int retriesOnFailure, params string[] args)
         {
             // Run the command.
-            TfsVCPorcelainCommandResult result = await TryRunPorcelainCommandAsync(formatFlags, args);
+            TfsVCPorcelainCommandResult result = await TryRunPorcelainCommandAsync(formatFlags, retriesOnFailure, args);
             ArgUtil.NotNull(result, nameof(result));
             if (result.Exception != null)
             {
@@ -140,7 +220,21 @@ namespace Agent.Plugins.Repository
             return string.Join(Environment.NewLine, result.Output ?? new List<string>());
         }
 
-        protected async Task<TfsVCPorcelainCommandResult> TryRunPorcelainCommandAsync(FormatFlags formatFlags, params string[] args)
+        protected async Task<TfsVCPorcelainCommandResult> TryRunPorcelainCommandAsync(FormatTags formatFlags, int retriesOnFailure, params string[] args)
+        {
+            var result = await TryRunPorcelainCommandAsync(formatFlags, args);
+            for (int attempt = 0; attempt < retriesOnFailure && result.Exception != null && result.Exception?.ExitCode != 1; attempt++)
+            {
+                ExecutionContext.Warning($"{result.Exception.Message}");
+                int sleep = Math.Min(200 * (int)Math.Pow(5, attempt), 30000);
+                ExecutionContext.Output($"Sleeping for {sleep} ms before starting {attempt + 1}/{retriesOnFailure} retry");
+                await Task.Delay(sleep);
+                result = await TryRunPorcelainCommandAsync(formatFlags, args);
+            }
+            return result;
+        }
+
+        protected async Task<TfsVCPorcelainCommandResult> TryRunPorcelainCommandAsync(FormatTags formatFlags, params string[] args)
         {
             // Validation.
             ArgUtil.NotNull(args, nameof(args));
@@ -167,7 +261,20 @@ namespace Agent.Plugins.Repository
                         result.Output.Add(e.Data);
                     }
                 };
-                string arguments = FormatArguments(formatFlags, args);
+                string formattedArguments = FormatArguments(formatFlags, args);
+                string arguments = "";
+                string cmdFileName = "";
+                bool useSecretParameterPassing = AgentKnobs.TfVCUseSecureParameterPassing.GetValue(ExecutionContext).AsBoolean();
+                if (useSecretParameterPassing)
+                {
+                    cmdFileName = WriteCommandToFile(formattedArguments);
+                    arguments = $"@{cmdFileName}";
+                }
+                else
+                {
+                    arguments = formattedArguments;
+                }
+
                 ExecutionContext.Debug($@"tf {arguments}");
                 // TODO: Test whether the output encoding needs to be specified on a non-Latin OS.
                 try
@@ -186,11 +293,35 @@ namespace Agent.Plugins.Repository
                     result.Exception = ex;
                 }
 
+                if (useSecretParameterPassing)
+                {
+                    CleanupTfsVCOutput(ref result, formattedArguments);
+                    try
+                    {
+                        await IOUtil.DeleteFileWithRetry(Path.Combine(this.SourcesDirectory, cmdFileName), CancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        ExecutionContext.Output($"Unable to delete command file, ex:{ex.GetType}");
+                        throw;
+                    }
+                }
+
                 return result;
             }
         }
 
-        private string FormatArguments(FormatFlags formatFlags, params string[] args)
+        private void CleanupTfsVCOutput(ref TfsVCPorcelainCommandResult command, string executedCommand)
+        {
+            // tf.exe removes double quotes from the output, we also replace it in the input command to correctly find the extra output
+            List<string> stringsToRemove = command
+                .Output
+                .Where(item => item.Contains(executedCommand.Replace("\"", "")))
+                .ToList();
+            command.Output.RemoveAll(item => stringsToRemove.Contains(item));
+        }
+
+        private string FormatArguments(FormatTags formatFlags, params string[] args)
         {
             // Validation.
             ArgUtil.NotNull(args, nameof(args));
@@ -217,7 +348,7 @@ namespace Agent.Plugins.Repository
             }
 
             // Add the common parameters.
-            if (!formatFlags.HasFlag(FormatFlags.OmitCollectionUrl))
+            if (!formatFlags.HasFlag(FormatTags.OmitCollectionUrl))
             {
                 if (Features.HasFlag(TfsVCFeatures.EscapedUrl))
                 {
@@ -244,7 +375,7 @@ namespace Agent.Plugins.Repository
                 }
             }
 
-            if (!formatFlags.HasFlag(FormatFlags.OmitLogin))
+            if (!formatFlags.HasFlag(FormatTags.OmitLogin))
             {
                 if (Features.HasFlag(TfsVCFeatures.LoginType))
                 {
@@ -257,7 +388,7 @@ namespace Agent.Plugins.Repository
                 }
             }
 
-            if (!formatFlags.HasFlag(FormatFlags.OmitNoPrompt))
+            if (!formatFlags.HasFlag(FormatTags.OmitNoPrompt))
             {
                 formattedArgs.Add($"{Switch}noprompt");
             }
@@ -266,7 +397,7 @@ namespace Agent.Plugins.Repository
         }
 
         [Flags]
-        protected enum FormatFlags
+        protected enum FormatTags
         {
             None = 0,
             OmitCollectionUrl = 1,

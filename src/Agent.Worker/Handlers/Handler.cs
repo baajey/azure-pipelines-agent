@@ -12,6 +12,11 @@ using System.Linq;
 using System.IO;
 using Microsoft.VisualStudio.Services.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk.Knob;
+using Microsoft.VisualStudio.Services.Agent.Worker.Telemetry;
+using Newtonsoft.Json;
+using System.Runtime.Versioning;
+using Agent.Sdk.Util;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 {
@@ -27,6 +32,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
         string TaskDirectory { get; set; }
         Pipelines.TaskStepDefinitionReference Task { get; set; }
         Task RunAsync();
+        void AfterExecutionContextInitialized();
     }
 
     public abstract class Handler : AgentService
@@ -34,6 +40,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
         // On Windows, the maximum supported size of a environment variable value is 32k.
         // You can set environment variables greater then 32K, but Node won't be able to read them.
         private const int _windowsEnvironmentVariableMaximumSize = 32766;
+
+        protected bool _continueAfterCancelProcessTreeKillAttempt;
 
         protected IWorkerCommandManager CommandManager { get; private set; }
 
@@ -55,6 +63,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             CommandManager = hostContext.GetService<IWorkerCommandManager>();
         }
 
+        public void AfterExecutionContextInitialized()
+        {
+            _continueAfterCancelProcessTreeKillAttempt = AgentKnobs.ContinueAfterCancelProcessTreeKillAttempt.GetValue(ExecutionContext).AsBoolean();
+            Trace.Info($"Handler.AfterExecutionContextInitialized _continueAfterCancelProcessTreeKillAttempt = {_continueAfterCancelProcessTreeKillAttempt}");
+        }
+
         protected void AddEndpointsToEnvironment()
         {
             Trace.Entering();
@@ -62,16 +76,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             ArgUtil.NotNull(ExecutionContext, nameof(ExecutionContext));
             ArgUtil.NotNull(ExecutionContext.Endpoints, nameof(ExecutionContext.Endpoints));
 
-            List<ServiceEndpoint> endpoints;
-            if ((RuntimeVariables.GetBoolean(Constants.Variables.Agent.AllowAllEndpoints) ?? false) ||
-                string.Equals(System.Environment.GetEnvironmentVariable("AGENT_ALLOWALLENDPOINTS") ?? string.Empty, bool.TrueString, StringComparison.OrdinalIgnoreCase))
-            {
-                endpoints = ExecutionContext.Endpoints; // todo: remove after sprint 120 or so
-            }
-            else
-            {
-                endpoints = Endpoints;
-            }
+            List<ServiceEndpoint> endpoints = Endpoints;
 
             // Add the endpoints to the environment variable dictionary.
             foreach (ServiceEndpoint endpoint in endpoints)
@@ -110,7 +115,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                     foreach (KeyValuePair<string, string> pair in endpoint.Authorization.Parameters)
                     {
                         AddEnvironmentVariable(
-                            key: $"ENDPOINT_AUTH_PARAMETER_{partialKey}_{pair.Key?.Replace(' ', '_').ToUpperInvariant()}",
+                            key: $"ENDPOINT_AUTH_PARAMETER_{partialKey}_{VarUtil.ConvertToEnvVariableFormat(pair.Key, preserveCase: false)}",
                             value: pair.Value);
                     }
                 }
@@ -126,7 +131,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                         foreach (KeyValuePair<string, string> pair in endpoint.Data)
                         {
                             AddEnvironmentVariable(
-                                key: $"ENDPOINT_DATA_{partialKey}_{pair.Key?.Replace(' ', '_').ToUpperInvariant()}",
+                                key: $"ENDPOINT_DATA_{partialKey}_{VarUtil.ConvertToEnvVariableFormat(pair.Key, preserveCase: false)}",
                                 value: pair.Value);
                         }
                     }
@@ -140,16 +145,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             ArgUtil.NotNull(ExecutionContext, nameof(ExecutionContext));
             ArgUtil.NotNull(SecureFiles, nameof(SecureFiles));
 
-            List<SecureFile> secureFiles;
-            if ((RuntimeVariables.GetBoolean(Constants.Variables.Agent.AllowAllSecureFiles) ?? false) ||
-                string.Equals(System.Environment.GetEnvironmentVariable("AGENT_ALLOWALLSECUREFILES") ?? string.Empty, bool.TrueString, StringComparison.OrdinalIgnoreCase))
-            {
-                secureFiles = ExecutionContext.SecureFiles ?? new List<SecureFile>(0); // todo: remove after sprint 121 or so
-            }
-            else
-            {
-                secureFiles = SecureFiles;
-            }
+            List<SecureFile> secureFiles = SecureFiles;
 
             // Add the secure files to the environment variable dictionary.
             foreach (SecureFile secureFile in secureFiles)
@@ -177,7 +173,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             foreach (KeyValuePair<string, string> pair in Inputs)
             {
                 AddEnvironmentVariable(
-                    key: $"INPUT_{pair.Key?.Replace(' ', '_').ToUpperInvariant()}",
+                    key: $"INPUT_{VarUtil.ConvertToEnvVariableFormat(pair.Key, preserveCase: false)}",
                     value: pair.Value);
             }
         }
@@ -191,20 +187,20 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 
             // Add the public variables.
             var names = new List<string>();
-            foreach (KeyValuePair<string, string> pair in RuntimeVariables.Public)
+            foreach (Variable variable in RuntimeVariables.Public)
             {
                 // Add "agent.jobstatus" using the unformatted name and formatted name.
-                if (string.Equals(pair.Key, Constants.Variables.Agent.JobStatus, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(variable.Name, Constants.Variables.Agent.JobStatus, StringComparison.OrdinalIgnoreCase))
                 {
-                    AddEnvironmentVariable(pair.Key, pair.Value);
+                    AddEnvironmentVariable(variable.Name, variable.Value);
                 }
 
                 // Add the variable using the formatted name.
-                string formattedKey = (pair.Key ?? string.Empty).Replace('.', '_').Replace(' ', '_').ToUpperInvariant();
-                AddEnvironmentVariable(formattedKey, pair.Value);
+                string formattedName = VarUtil.ConvertToEnvVariableFormat(variable.Name, variable.PreserveCase);
+                AddEnvironmentVariable(formattedName, variable.Value);
 
                 // Store the name.
-                names.Add(pair.Key ?? string.Empty);
+                names.Add(variable.Name ?? string.Empty);
             }
 
             // Add the public variable names.
@@ -217,14 +213,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             {
                 // Add the secret variables.
                 var secretNames = new List<string>();
-                foreach (KeyValuePair<string, string> pair in RuntimeVariables.Private)
+                foreach (Variable variable in RuntimeVariables.Private)
                 {
                     // Add the variable using the formatted name.
-                    string formattedKey = (pair.Key ?? string.Empty).Replace('.', '_').Replace(' ', '_').ToUpperInvariant();
-                    AddEnvironmentVariable($"SECRET_{formattedKey}", pair.Value);
+                    string formattedName = VarUtil.ConvertToEnvVariableFormat(variable.Name, variable.PreserveCase);
+                    AddEnvironmentVariable($"SECRET_{formattedName}", variable.Value);
 
                     // Store the name.
-                    secretNames.Add(pair.Key ?? string.Empty);
+                    secretNames.Add(variable.Name ?? string.Empty);
                 }
 
                 // Add the secret variable names.
@@ -254,18 +250,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             Trace.Entering();
             ArgUtil.NotNull(ExecutionContext.TaskVariables, nameof(ExecutionContext.TaskVariables));
 
-            foreach (KeyValuePair<string, string> pair in ExecutionContext.TaskVariables.Public)
+            foreach (Variable variable in ExecutionContext.TaskVariables.Public)
             {
                 // Add the variable using the formatted name.
-                string formattedKey = (pair.Key ?? string.Empty).Replace('.', '_').Replace(' ', '_').ToUpperInvariant();
-                AddEnvironmentVariable($"VSTS_TASKVARIABLE_{formattedKey}", pair.Value);
+                string formattedKey = VarUtil.ConvertToEnvVariableFormat(variable.Name, variable.PreserveCase);
+                AddEnvironmentVariable($"VSTS_TASKVARIABLE_{formattedKey}", variable.Value);
             }
 
-            foreach (KeyValuePair<string, string> pair in ExecutionContext.TaskVariables.Private)
+            foreach (Variable variable in ExecutionContext.TaskVariables.Private)
             {
                 // Add the variable using the formatted name.
-                string formattedKey = (pair.Key ?? string.Empty).Replace('.', '_').Replace(' ', '_').ToUpperInvariant();
-                AddEnvironmentVariable($"VSTS_TASKVARIABLE_{formattedKey}", pair.Value);
+                string formattedKey = VarUtil.ConvertToEnvVariableFormat(variable.Name, variable.PreserveCase);
+                AddEnvironmentVariable($"VSTS_TASKVARIABLE_{formattedKey}", variable.Value);
             }
         }
 
@@ -302,6 +298,96 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                 string newPath = PathUtil.PrependPath(prepend, originalPath);
                 AddEnvironmentVariable(Constants.PathVariable, newPath);
             }
+        }
+
+        [SupportedOSPlatform("windows")]
+        protected bool PsModulePathContainsPowershellCoreLocations()
+        {
+            bool checkLocationsKnob = AgentKnobs.CheckPsModulesLocations.GetValue(HostContext).AsBoolean();
+
+            bool isPwshCore = Inputs.TryGetValue("pwsh", out string pwsh) && StringUtil.ConvertToBoolean(pwsh);
+
+            if (!PlatformUtil.RunningOnWindows || !checkLocationsKnob || isPwshCore)
+            {
+                return false;
+            }
+
+            const string PSModulePath = nameof(PSModulePath);
+
+            bool localVariableExists = Environment.TryGetValue(PSModulePath, out string localVariable);
+            bool localVariableContainsPwshLocations = PsModulePathUtil.ContainsPowershellCoreLocations(localVariable);
+
+            // Special case when the env variable is set for local process environment
+            // for example by vso command in a preceding pipeline step
+            if (localVariableExists && !localVariableContainsPwshLocations)
+            {
+                return false;
+            }
+
+            string systemVariable = System.Environment.GetEnvironmentVariable(PSModulePath);
+
+            bool systemVariableContainsPwshLocations = PsModulePathUtil.ContainsPowershellCoreLocations(systemVariable);
+
+            return localVariableContainsPwshLocations || systemVariableContainsPwshLocations;
+        }
+
+        [SupportedOSPlatform("windows")]
+        protected void RemovePSModulePathFromEnvironment()
+        {
+            if (PlatformUtil.RunningOnWindows == false
+                || AgentKnobs.CleanupPSModules.GetValue(ExecutionContext).AsBoolean() == false)
+            {
+                return;
+            }
+            try
+            {
+                if (WindowsProcessUtil.IsAgentRunningInPowerShellCore())
+                {
+                    AddEnvironmentVariable("PSModulePath", "");
+                    Trace.Info("PSModulePath is removed from environment since agent is running on Windows and in PowerShell.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.Error(ex.Message);
+
+                var telemetry = new Dictionary<string, string>()
+                {
+                    ["ParentProcessFinderError"] = StringUtil.Loc("ParentProcessFinderError")
+                };
+                PublishTelemetry(telemetry);
+
+                ExecutionContext.Error(StringUtil.Loc("ParentProcessFinderError"));
+            }
+        }
+
+        // This overload is to handle specific types some other way.
+        protected void PublishTelemetry<T>(
+            Dictionary<string, T> telemetryData,
+            string feature = "TaskHandler"
+        )
+        {
+            // JsonConvert.SerializeObject always converts to base object.
+            PublishTelemetry((object)telemetryData, feature);
+        }
+
+        private void PublishTelemetry(
+            object telemetryData,
+            string feature = "TaskHandler"
+        )
+        {
+            ArgUtil.NotNull(Task, nameof(Task));
+
+            var cmd = new Command("telemetry", "publish")
+            {
+                Data = JsonConvert.SerializeObject(telemetryData, Formatting.None)
+            };
+            cmd.Properties.Add("area", "PipelinesTasks");
+            cmd.Properties.Add("feature", feature);
+
+            var publishTelemetryCmd = new TelemetryCommandExtension();
+            publishTelemetryCmd.Initialize(HostContext);
+            publishTelemetryCmd.ProcessCommand(ExecutionContext, cmd);
         }
     }
 }

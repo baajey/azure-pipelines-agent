@@ -7,15 +7,18 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.Versioning;
 
 namespace Microsoft.VisualStudio.Services.Agent.Util
 {
     [ServiceLocator(Default = typeof(PowerShellExeUtil))]
+    [SupportedOSPlatform("windows")]
     public interface IPowerShellExeUtil : IAgentService
     {
         string GetPath();
     }
 
+    [SupportedOSPlatform("windows")]
     public sealed class PowerShellExeUtil : AgentService, IPowerShellExeUtil
     {
         private static readonly Version MinimumVersion = new Version(3, 0);
@@ -88,7 +91,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             PowerShellInfo latest = infos.OrderByDescending(x => x.Version).FirstOrDefault();
             if (latest == null)
             {
-                throw new Exception(StringUtil.Loc("PowerShellNotInstalledMinVersion0", MinimumVersion));
+                throw new InvalidOperationException(StringUtil.Loc("PowerShellNotInstalledMinVersion0", MinimumVersion));
             }
 
             return latest.Path;

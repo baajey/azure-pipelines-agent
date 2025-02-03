@@ -13,6 +13,7 @@ using Xunit;
 using Microsoft.VisualStudio.Services.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.VisualStudio.Services.Agent.Listener.Telemetry;
 
 namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
 {
@@ -29,6 +30,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
         private Mock<IVstsAgentWebProxy> _proxy;
         private Mock<IAgentCertificateManager> _cert;
         private Mock<ISelfUpdater> _updater;
+        private Mock<IAgenetListenerTelemetryPublisher> _listenerTelemetryPublisher;
 
         public AgentL0()
         {
@@ -43,6 +45,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
             _proxy = new Mock<IVstsAgentWebProxy>();
             _cert = new Mock<IAgentCertificateManager>();
             _updater = new Mock<ISelfUpdater>();
+            _listenerTelemetryPublisher = new Mock<IAgenetListenerTelemetryPublisher>();
         }
 
         private AgentJobRequestMessage CreateJobRequestMessage(string jobName)
@@ -66,6 +69,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
         [Trait("Level", "L0")]
         [Trait("Category", "Agent")]
         //process 2 new job messages, and one cancel message
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Maintainability", "CA2000:Dispose objects before losing scope")]
         public async void TestRunAsync()
         {
             using (var hc = new TestHostContext(this))
@@ -80,6 +84,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
+
                 agent.Initialize(hc);
                 var settings = new AgentSettings
                 {
@@ -192,7 +198,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
-
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
                 var command = new CommandSettings(hc, args);
 
                 _configurationManager.Setup(x => x.IsConfigured()).Returns(true);
@@ -226,6 +232,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
 
                 var command = new CommandSettings(hc, new[] { "run" });
 
@@ -262,6 +269,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
 
                 var command = new CommandSettings(hc, new string[] { });
 
@@ -300,6 +308,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
+
                 agent.Initialize(hc);
                 var settings = new AgentSettings
                 {
@@ -396,6 +406,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
+
                 agent.Initialize(hc);
                 var settings = new AgentSettings
                 {
@@ -500,6 +512,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
                 hc.SetSingleton<ISelfUpdater>(_updater.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
 
                 agent.Initialize(hc);
                 var settings = new AgentSettings
@@ -581,7 +594,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
         [InlineData("--version")]
         [InlineData("--commit")]
         [InlineData("--bad-argument", Constants.Agent.ReturnCode.TerminatedError)]
-        public async void TestInfoArgumentsCLI(string arg, int expected=Constants.Agent.ReturnCode.Success)
+        public async void TestInfoArgumentsCLI(string arg, int expected = Constants.Agent.ReturnCode.Success)
         {
             using (var hc = new TestHostContext(this))
             {
@@ -591,6 +604,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                 hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
                 hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
 
                 var command = new CommandSettings(hc, new[] { arg });
 
@@ -651,7 +665,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
         [InlineData("configure", true)] //TODO: this passes. If already configured, probably should error out asked to configure again
         [InlineData("remove", false)] //TODO: this passes. If already not configured, probably should error out
         [InlineData("remove", true)]
-        public async void TestConfigureCLI(string arg, bool IsConfigured, int expected=Constants.Agent.ReturnCode.Success)
+        public async void TestConfigureCLI(string arg, bool IsConfigured, int expected = Constants.Agent.ReturnCode.Success)
         {
             using (var hc = new TestHostContext(this))
             {
@@ -695,6 +709,128 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener
                     agent2.Initialize(hc);
                     var status2 = await agent2.ExecuteCommand(command);
                     Assert.True(status2 == Constants.Agent.ReturnCode.TerminatedError, $"Expected to return terminated exit code when handling exception after {arg}. Got: {status2}");
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Agent")]
+        //process 1 job message and one metadata message
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Maintainability", "CA2000:Dispose objects before losing scope")]
+        public async void TestMetadataUpdate()
+        {
+            using (var hc = new TestHostContext(this))
+            using (var agent = new Agent.Listener.Agent())
+            {
+                //Arrange
+                hc.SetSingleton<IConfigurationManager>(_configurationManager.Object);
+                hc.SetSingleton<IJobNotification>(_jobNotification.Object);
+                hc.SetSingleton<IMessageListener>(_messageListener.Object);
+                hc.SetSingleton<IPromptManager>(_promptManager.Object);
+                hc.SetSingleton<IAgentServer>(_agentServer.Object);
+                hc.SetSingleton<IVstsAgentWebProxy>(_proxy.Object);
+                hc.SetSingleton<IAgentCertificateManager>(_cert.Object);
+                hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IAgenetListenerTelemetryPublisher>(_listenerTelemetryPublisher.Object);
+
+                agent.Initialize(hc);
+                var settings = new AgentSettings
+                {
+                    PoolId = 43242
+                };
+
+                var message = new TaskAgentMessage()
+                {
+                    Body = JsonUtility.ToString(CreateJobRequestMessage("job1")),
+                    MessageId = 4234,
+                    MessageType = JobRequestMessageTypes.AgentJobRequest
+                };
+
+                var metadataMessage = new TaskAgentMessage()
+                {
+                    Body = JsonUtility.ToString(new JobMetadataMessage()
+                    {
+                        PostLinesFrequencyMillis = 500
+                    }),
+                    MessageId = 4235,
+                    MessageType = JobEventTypes.JobMetadataUpdate
+                };
+
+                var messages = new Queue<TaskAgentMessage>();
+                messages.Enqueue(message);
+                messages.Enqueue(metadataMessage);
+                var signalWorkerComplete = new SemaphoreSlim(0, 1);
+                _configurationManager.Setup(x => x.LoadSettings())
+                    .Returns(settings);
+                _configurationManager.Setup(x => x.IsConfigured())
+                    .Returns(true);
+                _messageListener.Setup(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()))
+                    .Returns(Task.FromResult<bool>(true));
+                _messageListener.Setup(x => x.GetNextMessageAsync(It.IsAny<CancellationToken>()))
+                    .Returns(async () =>
+                        {
+                            if (0 == messages.Count)
+                            {
+                                signalWorkerComplete.Release();
+                                await Task.Delay(2000, hc.AgentShutdownToken);
+                            }
+
+                            return messages.Dequeue();
+                        });
+                _messageListener.Setup(x => x.DeleteSessionAsync())
+                    .Returns(Task.CompletedTask);
+                _messageListener.Setup(x => x.DeleteMessageAsync(It.IsAny<TaskAgentMessage>()))
+                    .Returns(Task.CompletedTask);
+                _jobDispatcher.Setup(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<bool>()))
+                    .Callback(() =>
+                    {
+
+                    });
+                _jobNotification.Setup(x => x.StartClient(It.IsAny<String>(), It.IsAny<String>(), It.IsAny<CancellationToken>()))
+                    .Callback(() =>
+                    {
+
+                    });
+                _jobNotification.Setup(x => x.StartClient(It.IsAny<String>(), It.IsAny<String>()))
+                    .Callback(() =>
+                    {
+
+                    });
+
+                hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+
+                _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
+                //Act
+                var command = new CommandSettings(hc, new string[] { "run" });
+                Task agentTask = agent.ExecuteCommand(command);
+
+                //Assert
+                //wait for the agent to run one job
+                if (!await signalWorkerComplete.WaitAsync(2000))
+                {
+                    Assert.True(false, $"{nameof(_messageListener.Object.GetNextMessageAsync)} was not invoked.");
+                }
+                else
+                {
+                    //Act
+                    hc.ShutdownAgent(ShutdownReason.UserCancelled); //stop Agent
+
+                    //Assert
+                    Task[] taskToWait2 = { agentTask, Task.Delay(2000) };
+                    //wait for the Agent to exit
+                    await Task.WhenAny(taskToWait2);
+
+                    Assert.True(agentTask.IsCompleted, $"{nameof(agent.ExecuteCommand)} timed out.");
+                    Assert.True(!agentTask.IsFaulted, agentTask.Exception?.ToString());
+                    Assert.True(agentTask.IsCanceled);
+
+                    _jobDispatcher.Verify(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<bool>()), Times.Once(),
+                         $"{nameof(_jobDispatcher.Object.Run)} was not invoked.");
+                    _messageListener.Verify(x => x.GetNextMessageAsync(It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+                    _messageListener.Verify(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()), Times.Once());
+                    _messageListener.Verify(x => x.DeleteSessionAsync(), Times.Once());
+                    _messageListener.Verify(x => x.DeleteMessageAsync(It.IsAny<TaskAgentMessage>()), Times.AtLeastOnce());
                 }
             }
         }

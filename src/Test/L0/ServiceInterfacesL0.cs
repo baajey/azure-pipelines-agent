@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Microsoft.VisualStudio.Services.Agent.Listener;
+using Microsoft.VisualStudio.Services.Agent.Blob;
 using Microsoft.VisualStudio.Services.Agent.Capabilities;
 using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
 using Microsoft.VisualStudio.Services.Agent.Worker;
@@ -59,7 +60,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 typeof(IHostContext),
                 typeof(ITraceManager),
                 typeof(IThrottlingReporter),
-                typeof(ICapabilitiesProvider)
+                typeof(ICapabilitiesProvider),
+                typeof(IDedupRecord)
             };
             Validate(
                 assembly: typeof(IHostContext).GetTypeInfo().Assembly,
@@ -97,7 +99,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 typeof(IResultReader),
                 typeof(INUnitResultsXmlReader),
                 typeof(IWorkerCommand),
-                typeof(IWorkerCommandRestrictionPolicy)
+                typeof(ITaskRestrictionsChecker),
+                typeof(IRetryOptions)
             };
             Validate(
                 assembly: typeof(IStepsRunner).GetTypeInfo().Assembly,
@@ -116,7 +119,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                     continue;
                 }
 
-                if (interfaceTypeInfo.FullName.Contains("IConverter")){
+                if (interfaceTypeInfo.FullName.Contains("IConverter"))
+                {
                     continue;
                 }
 

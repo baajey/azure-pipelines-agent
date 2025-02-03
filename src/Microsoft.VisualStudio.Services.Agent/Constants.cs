@@ -10,7 +10,6 @@ namespace Microsoft.VisualStudio.Services.Agent
     public enum WellKnownDirectory
     {
         Bin,
-        Diag,
         Externals,
         LegacyPSHost,
         Root,
@@ -23,6 +22,9 @@ namespace Microsoft.VisualStudio.Services.Agent
         Tools,
         Update,
         Work,
+        TfLegacy,
+        ServerOMLegacy,
+        LegacyPSHostLegacy
     }
 
     public enum WellKnownConfigFile
@@ -38,6 +40,60 @@ namespace Microsoft.VisualStudio.Services.Agent
         ProxyBypass,
         Autologon,
         Options,
+        SetupInfo,
+        TaskExceptionList // We need to remove this config file - once Node 6 handler is dropped
+    }
+
+    public static class WellKnownTasks
+    {
+        public static class PluginTaskIds
+        {
+            // We need have the ID for the checkout task for now since it is not present in the azure-pipelines-tasks repo.
+            public static readonly Guid CheckoutTask = new Guid("6d15af64-176c-496d-b583-fd2ae21d4df4");
+        }
+
+        public static class MicrosoftExtensionTaskIds
+        {
+            public static readonly Guid GooglePlayIncreaseRolloutTask = new Guid("f8c97cf9-4e17-4244-b0fb-f540cea78153");
+            public static readonly Guid GooglePlayPromoteTask = new Guid("4dae1f76-29d3-482f-97d5-e3189a8347c2");
+            public static readonly Guid GooglePlayReleaseTask = new Guid("8cf7cac0-620b-11e5-b4cf-8565e60f4d27");
+            public static readonly Guid GooglePlayStatusUpdateTask = new Guid("92e6c372-4193-44e5-9db7-58d7d253f4d8");
+            public static readonly Guid AppStorePromoteTask = new Guid("cbbf7f14-c386-4c1f-80a3-fe500e2bd976");
+            public static readonly Guid AppStoreReleaseTask = new Guid("2e371150-da5e-11e5-83da-0943b1acc572");
+            public static readonly Guid IpaResignTask = new Guid("cbbf7f14-c386-4c1f-80a3-fe500e2bd977");
+
+            // ms.advancedsecurity-tasks
+            public static readonly Guid AdvancedSecurityPublishTask = new Guid("a95ad3e1-3950-494f-a460-963e3f5f6928");
+            public static readonly Guid AdvancedSecurityCodeqlAnalyze = new Guid("a9efc1ef-3900-494f-a460-963e3f5f6928");
+            public static readonly Guid AdvancedSecurityCodeqlAutobuild = new Guid("a63ec2fb-3600-494f-a460-963e3f5f6928");
+            public static readonly Guid AdvancedSecurityCodeqlInit = new Guid("a34f8529-3300-494f-a460-963e3f5f6928");
+            public static readonly Guid AdvancedSecurityDependencyScanning = new Guid("f97aace4-962a-441b-9141-b842d806b9c7");
+
+            // advancedsecurity.iac-tasks
+            public static readonly Guid TemplateAnalyzerSarif = new Guid("2ff4011a-8c38-46ae-9654-29d7d45ce875");
+            public static readonly Guid TerrascanSarif = new Guid("f1af679c-4cbf-4952-98c9-c772c8eb9920");
+            public static readonly Guid TrivySarif = new Guid("93e29b44-e118-445d-b809-ae3c7907bee7");
+        }
+
+        public static List<Guid> RequiredForTelemetry = new()
+        {
+            PluginTaskIds.CheckoutTask,
+            MicrosoftExtensionTaskIds.GooglePlayIncreaseRolloutTask,
+            MicrosoftExtensionTaskIds.GooglePlayPromoteTask,
+            MicrosoftExtensionTaskIds.GooglePlayReleaseTask,
+            MicrosoftExtensionTaskIds.GooglePlayStatusUpdateTask,
+            MicrosoftExtensionTaskIds.AppStorePromoteTask,
+            MicrosoftExtensionTaskIds.AppStoreReleaseTask,
+            MicrosoftExtensionTaskIds.IpaResignTask,
+            MicrosoftExtensionTaskIds.AdvancedSecurityPublishTask,
+            MicrosoftExtensionTaskIds.AdvancedSecurityCodeqlAnalyze,
+            MicrosoftExtensionTaskIds.AdvancedSecurityCodeqlAutobuild,
+            MicrosoftExtensionTaskIds.AdvancedSecurityCodeqlInit,
+            MicrosoftExtensionTaskIds.AdvancedSecurityDependencyScanning,
+            MicrosoftExtensionTaskIds.TemplateAnalyzerSarif,
+            MicrosoftExtensionTaskIds.TerrascanSarif,
+            MicrosoftExtensionTaskIds.TrivySarif
+        };
     }
 
     public static class Constants
@@ -54,10 +110,34 @@ namespace Microsoft.VisualStudio.Services.Agent
         public static string ProcessLookupId = "VSTS_PROCESS_LOOKUP_ID";
         public static string PluginTracePrefix = "##[plugin.trace]";
         public static readonly int AgentDownloadRetryMaxAttempts = 3;
+        public const string projectName = "projectName";
+        public const string CommandCorrelationIdEnvVar = "COMMAND_CORRELATION_ID";
+        public const string TaskInternalIssueSource = "TaskInternal";
 
         // Environment variable set on hosted Azure Pipelines images to
         // store the version of the image
         public static readonly string ImageVersionVariable = "ImageVersion";
+
+        public static class DefaultContainerMounts
+        {
+            public static readonly string Externals = "externals";
+            public static readonly string Work = "work";
+            public static readonly string Tasks = "tasks";
+            public static readonly string Tools = "tools";
+        }
+
+        public static class AsyncExecution
+        {
+            public static class Commands
+            {
+                public static class Names
+                {
+                    public static readonly string DetectDockerContainer = "DetectDockerContainer";
+                    public static readonly string GetAzureVMMetada = "GetAzureVMMetada";
+                    public static readonly string WindowsPreinstalledGitTelemetry = "WindowsPreinstalledGitTelemetry";
+                }
+            }
+        }
 
         public static class Agent
         {
@@ -95,6 +175,8 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public const string UserName = "username";
                     public const string WindowsLogonAccount = "windowslogonaccount";
                     public const string Work = "work";
+                    public const string ClientId = "clientid";
+                    public const string TenantId = "tenantid";
 
                     // Secret args. Must be added to the "Secrets" getter as well.
                     public const string Password = "password";
@@ -102,6 +184,8 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public const string SslClientCertPassword = "sslclientcertpassword";
                     public const string Token = "token";
                     public const string WindowsLogonPassword = "windowslogonpassword";
+                    public const string ClientSecret = "clientsecret";
+
                     public static string[] Secrets => new[]
                     {
                         Password,
@@ -109,6 +193,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                         SslClientCertPassword,
                         Token,
                         WindowsLogonPassword,
+                        ClientSecret,
                     };
                 }
 
@@ -118,6 +203,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public const string Remove = "remove";
                     public const string Run = "run";
                     public const string Warmup = "warmup";
+                    public const string ReAuth = "reauth";
                 }
 
                 //if you are adding a new flag, please make sure you update the
@@ -128,6 +214,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public const string AddDeploymentGroupTags = "adddeploymentgrouptags";
                     public const string AddMachineGroupTags = "addmachinegrouptags";
                     public const string AddEnvironmentVirtualMachineResourceTags = "addvirtualmachineresourcetags";
+                    public const string AlwaysExtractTask = "alwaysextracttask";
                     public const string Commit = "commit";
                     public const string DeploymentGroup = "deploymentgroup";
                     public const string DeploymentPool = "deploymentpool";
@@ -136,16 +223,21 @@ namespace Microsoft.VisualStudio.Services.Agent
                     public const string OverwriteAutoLogon = "overwriteautologon";
                     public const string GitUseSChannel = "gituseschannel";
                     public const string Help = "help";
+                    public const string DisableLogUploads = "disableloguploads";
+                    public const string ReStreamLogsToFiles = "restreamlogstofiles";
                     public const string MachineGroup = "machinegroup";
                     public const string Replace = "replace";
                     public const string NoRestart = "norestart";
                     public const string LaunchBrowser = "launchbrowser";
                     public const string Once = "once";
+                    public const string DebugMode = "debug";
                     public const string RunAsAutoLogon = "runasautologon";
                     public const string RunAsService = "runasservice";
+                    public const string PreventServiceStart = "preventservicestart";
                     public const string SslSkipCertValidation = "sslskipcertvalidation";
                     public const string Unattended = "unattended";
                     public const string Version = "version";
+                    public const string EnableServiceSidTypeUnrestricted = "enableservicesidtypeunrestricted";
                 }
             }
 
@@ -195,6 +287,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             public static readonly string Integrated = "Integrated";
             public static readonly string OAuth = "OAuth";
             public static readonly string ServiceIdentity = "ServiceIdentity";
+            public static readonly string ServicePrincipal = "SP";
         }
 
         public static class EndpointData
@@ -223,10 +316,13 @@ namespace Microsoft.VisualStudio.Services.Agent
             public static readonly string DiagDirectory = "_diag";
             public static readonly string ExternalsDirectory = "externals";
             public static readonly string LegacyPSHostDirectory = "vstshost";
+            public static readonly string LegacyPSHostLegacyDirectory = "vstshost-legacy";
             public static readonly string ServerOMDirectory = "vstsom";
+            public static readonly string ServerOMLegacyDirectory = "vstsom-legacy";
             public static readonly string TempDirectory = "_temp";
             public static readonly string TeeDirectory = "tee";
             public static readonly string TfDirectory = "tf";
+            public static readonly string TfLegacyDirectory = "tf-legacy";
             public static readonly string ToolDirectory = "_tool";
             public static readonly string TaskJsonFile = "task.json";
             public static readonly string TasksDirectory = "_tasks";
@@ -264,14 +360,16 @@ namespace Microsoft.VisualStudio.Services.Agent
                 // Keep alphabetical. If you add or remove a variable here, do the same in ReadOnlyVariables
                 //
                 public static readonly string AcceptTeeEula = "agent.acceptteeeula";
-                public static readonly string AllowAllEndpoints = "agent.allowAllEndpoints"; // remove after sprint 120 or so.
-                public static readonly string AllowAllSecureFiles = "agent.allowAllSecureFiles"; // remove after sprint 121 or so.
                 public static readonly string BuildDirectory = "agent.builddirectory";
+                public static readonly string CloudId = "agent.cloudid";
                 public static readonly string ContainerId = "agent.containerid";
+                public static readonly string ContainerMapping = "agent.containermapping";
                 public static readonly string ContainerNetwork = "agent.containernetwork";
                 public static readonly string Diagnostic = "agent.diagnostic";
+                public static readonly string FixPossibleGitOutOfMemoryProblem = "FIX_POSSIBLE_GIT_OUT_OF_MEMORY_PROBLEM";
                 public static readonly string HomeDirectory = "agent.homedirectory";
                 public static readonly string Id = "agent.id";
+                public static readonly string IsSelfHosted = "agent.isselfhosted";
                 public static readonly string GitUseSChannel = "agent.gituseschannel";
                 public static readonly string JobName = "agent.jobname";
                 public static readonly string JobStatus = "agent.jobstatus";
@@ -298,9 +396,12 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string SslSkipCertValidation = "agent.skipcertvalidation";
                 public static readonly string TempDirectory = "agent.TempDirectory";
                 public static readonly string ToolsDirectory = "agent.ToolsDirectory";
+                public static readonly string UseGitLongPaths = "USE_GIT_LONG_PATHS";
+                public static readonly string UseGitSingleThread = "USE_GIT_SINGLE_THREAD";
                 public static readonly string Version = "agent.version";
                 public static readonly string WorkFolder = "agent.workfolder";
                 public static readonly string WorkingDirectory = "agent.WorkingDirectory";
+                public static readonly string EnableAdditionalMaskingRegexes = "agent.enableadditionalmaskingregexes";
             }
 
             public static class Build
@@ -310,15 +411,16 @@ namespace Microsoft.VisualStudio.Services.Agent
                 //
                 public static readonly string ArtifactStagingDirectory = "build.artifactstagingdirectory";
                 public static readonly string BinariesDirectory = "build.binariesdirectory";
-                public static readonly string Number = "build.buildNumber";
                 public static readonly string Clean = "build.clean";
                 public static readonly string DefinitionName = "build.definitionname";
                 public static readonly string GatedRunCI = "build.gated.runci";
                 public static readonly string GatedShelvesetName = "build.gated.shelvesetname";
+                public static readonly string Number = "build.buildNumber";
                 public static readonly string RepoClean = "build.repository.clean";
                 public static readonly string RepoGitSubmoduleCheckout = "build.repository.git.submodulecheckout";
                 public static readonly string RepoId = "build.repository.id";
                 public static readonly string RepoLocalPath = "build.repository.localpath";
+                public static readonly string PipelineRepoName = "pipeline.repository.name";
                 public static readonly string RepoName = "build.Repository.name";
                 public static readonly string RepoProvider = "build.repository.provider";
                 public static readonly string RepoTfvcWorkspace = "build.repository.tfvc.workspace";
@@ -326,6 +428,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string SourceBranch = "build.sourcebranch";
                 public static readonly string SourceTfvcShelveset = "build.sourcetfvcshelveset";
                 public static readonly string SourceVersion = "build.sourceversion";
+                public static readonly string SourceVersionMessage = "build.sourceVersionMessage";
                 public static readonly string SourcesDirectory = "build.sourcesdirectory";
                 public static readonly string StagingDirectory = "build.stagingdirectory";
                 public static readonly string SyncSources = "build.syncSources";
@@ -349,6 +452,17 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string GitLfsSupport = "agent.source.git.lfs";
                 public static readonly string GitShallowDepth = "agent.source.git.shallowFetchDepth";
                 public static readonly string SkipSyncSource = "agent.source.skip";
+                public static readonly string EnableAdditionalMaskingRegexes = "agent.enableadditionalmaskingregexes";
+                public static readonly string UseMaskingPerformanceEnhancements = "agent.agentUseMaskingPerformanceEnhancements";
+            }
+
+            public static class Maintenance
+            {
+                //
+                // Keep alphabetical. If you add or remove a variable here, do the same in ReadOnlyVariables
+                //
+                public static readonly string DeleteWorkingDirectoryDaysThreshold = "maintenance.deleteworkingdirectory.daysthreshold";
+                public static readonly string JobTimeout = "maintenance.jobtimeoutinminutes";
             }
 
             public static class Pipeline
@@ -368,17 +482,17 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string ArtifactsDirectory = "system.artifactsDirectory";
                 public static readonly string AttemptNumber = "release.attemptNumber";
                 public static readonly string DisableRobocopy = "release.disableRobocopy";
+                public static readonly string ReleaseDefinitionId = "release.definitionId";
                 public static readonly string ReleaseDefinitionName = "release.definitionName";
+                public static readonly string ReleaseDescription = "release.releaseDescription";
+                public static readonly string ReleaseDownloadBufferSize = "release.artifact.download.buffersize";
                 public static readonly string ReleaseEnvironmentName = "release.environmentName";
                 public static readonly string ReleaseEnvironmentUri = "release.environmentUri";
-                public static readonly string ReleaseDefinitionId = "release.definitionId";
-                public static readonly string ReleaseDescription = "release.releaseDescription";
                 public static readonly string ReleaseId = "release.releaseId";
                 public static readonly string ReleaseName = "release.releaseName";
+                public static readonly string ReleaseParallelDownloadLimit = "release.artifact.download.parallellimit";
                 public static readonly string ReleaseRequestedForId = "release.requestedForId";
                 public static readonly string ReleaseUri = "release.releaseUri";
-                public static readonly string ReleaseDownloadBufferSize = "release.artifact.download.buffersize";
-                public static readonly string ReleaseParallelDownloadLimit = "release.artifact.download.parallellimit";
                 public static readonly string ReleaseWebUrl = "release.releaseWebUrl";
                 public static readonly string RequestorId = "release.requestedFor";
                 public static readonly string RobocopyMT = "release.robocopyMT";
@@ -397,19 +511,26 @@ namespace Microsoft.VisualStudio.Services.Agent
                 public static readonly string Debug = "system.debug";
                 public static readonly string DefaultWorkingDirectory = "system.defaultworkingdirectory";
                 public static readonly string DefinitionId = "system.definitionid";
+                public static readonly string DefinitionName = "system.definitionName";
                 public static readonly string EnableAccessToken = "system.enableAccessToken";
                 public static readonly string HostType = "system.hosttype";
+                public static readonly string IsAzureVM = "system.isazurevm";
+                public static readonly string IsDockerContainer = "system.isdockercontainer";
                 public static readonly string JobAttempt = "system.jobAttempt";
+                public static readonly string JobDisplayName = "system.jobDisplayName";
                 public static readonly string JobId = "system.jobId";
                 public static readonly string JobName = "system.jobName";
                 public static readonly string PhaseAttempt = "system.phaseAttempt";
                 public static readonly string PhaseDisplayName = "system.phaseDisplayName";
                 public static readonly string PhaseName = "system.phaseName";
+                public static readonly string PlanId = "system.planId";
                 public static readonly string PreferGitFromPath = "system.prefergitfrompath";
                 public static readonly string PullRequestTargetBranchName = "system.pullrequest.targetbranch";
                 public static readonly string SelfManageGitCreds = "system.selfmanagegitcreds";
                 public static readonly string ServerType = "system.servertype";
+                public static readonly string SourceVersionMessage = "system.sourceVersionMessage";
                 public static readonly string StageAttempt = "system.stageAttempt";
+                public static readonly string StageDisplayName = "system.stageDisplayName";
                 public static readonly string StageName = "system.stageName";
                 public static readonly string TFServerUrl = "system.TeamFoundationServerUri"; // back compat variable, do not document
                 public static readonly string TeamProject = "system.teamproject";
@@ -423,20 +544,36 @@ namespace Microsoft.VisualStudio.Services.Agent
                 // Keep alphabetical. If you add or remove a variable here, do the same in ReadOnlyVariables
                 //
                 public static readonly string DisplayName = "task.displayname";
+                /// <summary>
+                /// Declares requirement to skip translating of strings into checkout tasks.
+                /// It's required to prevent translating of agent system paths in container jobs.
+                /// This is for internal agent usage, set up during task execution and is not indented to be used in
+                /// cross-service communication/obtained by users.
+                /// </summary>
+                public static readonly string SkipTranslatorForCheckout = "task.skipTranslatorForCheckout";
+
+                /// <summary>
+                /// Declares requirement to publish telemetry for task or not. This is based on the IsServedOwned field in the TaskStep info
+                /// which the agent obtains from the execution plan (AgentJobRequestMessage) and also some certain that required for telemetry.
+                /// The main idea is to avoid publishing telemetry from the customer's tasks that is installed using TFS-CLI tool.
+                /// </summary>
+                public static readonly string PublishTelemetry = "task.publishTelemetry";
             }
 
             public static List<string> ReadOnlyVariables = new List<string>(){
                 // Agent variables
                 Agent.AcceptTeeEula,
-                Agent.AllowAllEndpoints,
-                Agent.AllowAllSecureFiles,
                 Agent.BuildDirectory,
+                Agent.CloudId,
                 Agent.ContainerId,
+                Agent.ContainerMapping,
                 Agent.ContainerNetwork,
                 Agent.Diagnostic,
+                Agent.FixPossibleGitOutOfMemoryProblem,
+                Agent.GitUseSChannel,
                 Agent.HomeDirectory,
                 Agent.Id,
-                Agent.GitUseSChannel,
+                Agent.IsSelfHosted,
                 Agent.JobName,
                 Agent.JobStatus,
                 Agent.MachineName,
@@ -444,35 +581,39 @@ namespace Microsoft.VisualStudio.Services.Agent
                 Agent.OS,
                 Agent.OSArchitecture,
                 Agent.OSVersion,
+                Agent.ProxyBypassList,
+                Agent.ProxyPassword,
                 Agent.ProxyUrl,
                 Agent.ProxyUsername,
-                Agent.ProxyPassword,
-                Agent.ProxyBypassList,
-                Agent.RetainDefaultEncoding,
                 Agent.ReadOnlyVariables,
+                Agent.RetainDefaultEncoding,
                 Agent.RootDirectory,
                 Agent.RunMode,
                 Agent.ServerOMDirectory,
                 Agent.ServicePortPrefix,
                 Agent.SslCAInfo,
                 Agent.SslClientCert,
-                Agent.SslClientCertKey,
                 Agent.SslClientCertArchive,
+                Agent.SslClientCertKey,
                 Agent.SslClientCertPassword,
                 Agent.SslSkipCertValidation,
                 Agent.TempDirectory,
                 Agent.ToolsDirectory,
+                Agent.UseGitLongPaths,
+                Agent.UseGitSingleThread,
                 Agent.Version,
                 Agent.WorkFolder,
                 Agent.WorkingDirectory,
+                Agent.EnableAdditionalMaskingRegexes,
                 // Build variables
                 Build.ArtifactStagingDirectory,
                 Build.BinariesDirectory,
-                Build.Number,
                 Build.Clean,
                 Build.DefinitionName,
                 Build.GatedRunCI,
                 Build.GatedShelvesetName,
+                Build.Number,
+                Build.PipelineRepoName,
                 Build.RepoClean,
                 Build.RepoGitSubmoduleCheckout,
                 Build.RepoId,
@@ -484,6 +625,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 Build.SourceBranch,
                 Build.SourceTfvcShelveset,
                 Build.SourceVersion,
+                Build.SourceVersionMessage,
                 Build.SourcesDirectory,
                 Build.StagingDirectory,
                 Build.SyncSources,
@@ -495,6 +637,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 Features.GitLfsSupport,
                 Features.GitShallowDepth,
                 Features.SkipSyncSource,
+                Features.UseMaskingPerformanceEnhancements,
                 // Pipeline variables
                 Pipeline.Workspace,
                 // Release variables
@@ -502,17 +645,17 @@ namespace Microsoft.VisualStudio.Services.Agent
                 Release.ArtifactsDirectory,
                 Release.AttemptNumber,
                 Release.DisableRobocopy,
+                Release.ReleaseDefinitionId,
                 Release.ReleaseDefinitionName,
+                Release.ReleaseDescription,
+                Release.ReleaseDownloadBufferSize,
                 Release.ReleaseEnvironmentName,
                 Release.ReleaseEnvironmentUri,
-                Release.ReleaseDefinitionId,
-                Release.ReleaseDescription,
                 Release.ReleaseId,
                 Release.ReleaseName,
+                Release.ReleaseParallelDownloadLimit,
                 Release.ReleaseRequestedForId,
                 Release.ReleaseUri,
-                Release.ReleaseDownloadBufferSize,
-                Release.ReleaseParallelDownloadLimit,
                 Release.ReleaseWebUrl,
                 Release.RequestorId,
                 Release.RobocopyMT,
@@ -525,26 +668,35 @@ namespace Microsoft.VisualStudio.Services.Agent
                 System.Debug,
                 System.DefaultWorkingDirectory,
                 System.DefinitionId,
+                System.DefinitionName,
                 System.EnableAccessToken,
                 System.HostType,
+                System.IsAzureVM,
+                System.IsDockerContainer,
                 System.JobAttempt,
+                System.JobDisplayName,
                 System.JobId,
                 System.JobName,
                 System.PhaseAttempt,
                 System.PhaseDisplayName,
                 System.PhaseName,
+                System.PlanId,
                 System.PreferGitFromPath,
                 System.PullRequestTargetBranchName,
                 System.SelfManageGitCreds,
                 System.ServerType,
+                System.SourceVersionMessage,
                 System.StageAttempt,
+                System.StageDisplayName,
                 System.StageName,
                 System.TFServerUrl,
                 System.TeamProject,
                 System.TeamProjectId,
                 System.WorkFolder,
                 // Task variables
-                Task.DisplayName
+                Task.DisplayName,
+                Task.SkipTranslatorForCheckout,
+                Task.PublishTelemetry
             };
         }
     }

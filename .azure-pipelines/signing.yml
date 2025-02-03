@@ -1,46 +1,67 @@
+# This Yaml Document has been converted by ESAI Yaml Pipeline Conversion Tool.
 parameters:
-  layoutRoot: ''
-
+- name: layoutRoot
+  type: string
+- name: isWindows
+  type: boolean
+  default: true
 steps:
-# Guard against missing parameters
-- ${{ if eq(parameters.layoutRoot, '') }}:
-  - |
-      Badly configured build; an expected parameter is missing. //
-      layoutRoot: ${{ parameters.layoutRoot }}
+- ${{ if parameters.isWindows }}:
+  - task: PowerShell@2
+    inputs:
+      targetType: 'filePath'
+      filePath: ./.azure-pipelines/scripts/RemoveSignatureForThirdPartyAssemlies.ps1
+      arguments: '-LayoutRoot ${{ parameters.layoutRoot }}'
+      errorActionPreference: 'continue'
+    displayName: Remove signatures from the third party packages
+    condition: ne(variables['DISABLE_SIGNATURE_REMOVAL'], 'true')
 
-- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@1
-  inputs:
-    ConnectedServiceName: VSTSAgentESRP
-    FolderPath: '${{ parameters.layoutRoot }}\bin'
-    Pattern: AgentService.exe
-    signConfigType: inlineSignParams
-    inlineOperation: |
-      [{
-      "keyCode": "CP-235845-SN",
-      "operationSetCode": "StrongNameSign",
-      "parameters": [],
-      "toolName": "sign",
-      "toolVersion": "1.0"
-      },
-      {
-      "keyCode": "CP-235845-SN",
-      "operationSetCode": "StrongNameVerify",
-      "parameters": [],
-      "toolName": "sign",
-      "toolVersion": "1.0"
-      }
-      ]
-  displayName: Sign Agent Assemblies (Strong Name Signing)
+  - task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@5
+    inputs:
+      ConnectedServiceName: $(ConnectedServiceName)
+      UseMSIAuthentication: true
+      AppRegistrationClientId: $(AppRegistrationClientId)
+      AppRegistrationTenantId: $(AppRegistrationTenantId)
+      EsrpClientId: $(EsrpClientId)
+      AuthAKVName: $(AuthAKVName)
+      AuthSignCertName: $(AuthSignCertName)
+      FolderPath: '${{ parameters.layoutRoot }}/bin'
+      Pattern: AgentService.exe
+      signConfigType: inlineSignParams
+      inlineOperation: |
+        [{
+        "keyCode": "CP-235845-SN",
+        "operationSetCode": "StrongNameSign",
+        "parameters": [],
+        "toolName": "sign",
+        "toolVersion": "1.0"
+        },
+        {
+        "keyCode": "CP-235845-SN",
+        "operationSetCode": "StrongNameVerify",
+        "parameters": [],
+        "toolName": "sign",
+        "toolVersion": "1.0"
+        }
+        ]
+    displayName: Sign Agent Assemblies (Strong Name Signing)
 
-- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@1
+- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@5
   inputs:
-    ConnectedServiceName: VSTSAgentESRP
-    FolderPath: '${{ parameters.layoutRoot }}\bin'
+    ConnectedServiceName: $(ConnectedServiceName)
+    UseMSIAuthentication: true
+    AppRegistrationClientId: $(AppRegistrationClientId)
+    AppRegistrationTenantId: $(AppRegistrationTenantId)
+    EsrpClientId: $(EsrpClientId)
+    AuthAKVName: $(AuthAKVName)
+    AuthSignCertName: $(AuthSignCertName)
+    FolderPath: '${{ parameters.layoutRoot }}/bin'
     Pattern: |
       Agent.*.dll
       Agent.*.exe
       Microsoft.VisualStudio.Services.Agent.dll
       AgentService.exe
+      **\AgentService.resources.dll
     UseMinimatch: true
     signConfigType: inlineSignParams
     inlineOperation: |
@@ -81,9 +102,15 @@ steps:
       ]
   displayName: Sign Agent Assemblies (Authenticode Signing)
 
-- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@1
+- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@5
   inputs:
-    ConnectedServiceName: VSTSAgentESRP
+    ConnectedServiceName: $(ConnectedServiceName)
+    UseMSIAuthentication: true
+    AppRegistrationClientId: $(AppRegistrationClientId)
+    AppRegistrationTenantId: $(AppRegistrationTenantId)
+    EsrpClientId: $(EsrpClientId)
+    AuthAKVName: $(AuthAKVName)
+    AuthSignCertName: $(AuthSignCertName)
     FolderPath: '${{ parameters.layoutRoot }}'
     Pattern: |
       bin\powershell\**\*.ps1
@@ -131,28 +158,22 @@ steps:
       ]
   displayName: Sign PowerShell Scripts (Authenticode Signing)
 
-- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@1
+- task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@5
   inputs:
-    ConnectedServiceName: VSTSAgentESRP
+    ConnectedServiceName: $(ConnectedServiceName)
+    UseMSIAuthentication: true
+    AppRegistrationClientId: $(AppRegistrationClientId)
+    AppRegistrationTenantId: $(AppRegistrationTenantId)
+    EsrpClientId: $(EsrpClientId)
+    AuthAKVName: $(AuthAKVName)
+    AuthSignCertName: $(AuthSignCertName)
     FolderPath: '${{ parameters.layoutRoot }}'
     Pattern: |
-      bin\Ben.Demystifier.dll
-      bin\DotNet.Glob.dll
-      bin\Minimatch.dll
-      bin\NCrontab.Signed.dll
-      bin\Newtonsoft.Json.dll
-      bin\Newtonsoft.Json.Bson.dll
-      bin\RuntimeContracts.dll
-      bin\System.Interactive.Async.dll
-      bin\System.IO.Abstractions.dll
-      bin\YamlDotNet.dll
-      externals\git\**\*.dll
-      externals\git\**\*.exe
-      externals\node\bin\node.exe
-      externals\node10\bin\node.exe
-      externals\vstshost\Minimatch.dll
-      externals\vstsom\Newtonsoft.Json.dll
-      externals\tf\Newtonsoft.Json.dll
+      bin\**\*.dll
+      bin\**\*.exe
+      externals\**\*.exe
+      externals\**\*.dll
+      externals\**\*.pyd
     UseMinimatch: true
     signConfigType: inlineSignParams
     inlineOperation: |
@@ -202,3 +223,4 @@ steps:
     SourceFolder: '${{ parameters.layoutRoot }}'
     Contents: '**\CodeSignSummary-*.md'
   displayName: Delete CodeSignSummary.md
+  retryCountOnTaskFailure: 4

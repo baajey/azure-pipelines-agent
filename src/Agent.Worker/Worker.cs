@@ -9,6 +9,8 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.VisualStudio.Services.WebApi;
+using Agent.Sdk.Util;
+using Agent.Sdk.Knob;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -21,7 +23,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
     public sealed class Worker : AgentService, IWorker
     {
         private readonly TimeSpan _workerStartTimeout = TimeSpan.FromSeconds(30);
-        private static readonly char[] _quoteLikeChars = new char[] {'\'', '"'};
+        private static readonly char[] _quoteLikeChars = new char[] { '\'', '"' };
 
 
         public async Task<int> RunAsync(string pipeIn, string pipeOut)
@@ -31,7 +33,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             ArgUtil.NotNullOrEmpty(pipeOut, nameof(pipeOut));
             var agentWebProxy = HostContext.GetService<IVstsAgentWebProxy>();
             var agentCertManager = HostContext.GetService<IAgentCertificateManager>();
-            VssUtil.InitializeVssClientSettings(HostContext.UserAgent, agentWebProxy.WebProxy, agentCertManager.VssClientCertificateManager);
+            VssUtil.InitializeVssClientSettings(HostContext.UserAgent, agentWebProxy.WebProxy, agentCertManager.VssClientCertificateManager, agentCertManager.SkipServerCertificateValidation);
 
             var jobRunner = HostContext.CreateService<IJobRunner>();
 
@@ -59,46 +61,69 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 ArgUtil.NotNull(jobMessage, nameof(jobMessage));
                 HostContext.WritePerfCounter($"WorkerJobMessageReceived_{jobMessage.RequestId.ToString()}");
 
+                Trace.Info("Deactivating vso commands in job message variables.");
+                jobMessage = WorkerUtilities.DeactivateVsoCommandsFromJobMessageVariables(jobMessage);
+
                 // Initialize the secret masker and set the thread culture.
                 InitializeSecretMasker(jobMessage);
                 SetCulture(jobMessage);
+
+                if(AgentKnobs.EnableNewSecretMasker.GetValue(HostContext).AsBoolean())
+                {
+                    Trace.Verbose($"{Constants.Variables.Agent.EnableAdditionalMaskingRegexes} is On, adding additional masking regexes");
+                    HostContext.AddAdditionalMaskingRegexes();
+                }
 
                 // Start the job.
                 Trace.Info($"Job message:{Environment.NewLine} {StringUtil.ConvertToJson(WorkerUtilities.ScrubPiiData(jobMessage))}");
                 Task<TaskResult> jobRunnerTask = jobRunner.RunAsync(jobMessage, jobRequestCancellationToken.Token);
 
-                // Start listening for a cancel message from the channel.
-                Trace.Info("Listening for cancel message from the channel.");
-                Task<WorkerMessage> channelTask = channel.ReceiveAsync(channelTokenSource.Token);
-
-                // Wait for one of the tasks to complete.
-                Trace.Info("Waiting for the job to complete or for a cancel message from the channel.");
-                Task.WaitAny(jobRunnerTask, channelTask);
-
-                // Handle if the job completed.
-                if (jobRunnerTask.IsCompleted)
+                bool cancel = false;
+                while (!cancel)
                 {
-                    Trace.Info("Job completed.");
-                    channelTokenSource.Cancel(); // Cancel waiting for a message from the channel.
-                    return TaskResultUtil.TranslateToReturnCode(await jobRunnerTask);
-                }
+                    // Start listening for a cancel message from the channel.
+                    Trace.Info("Listening for cancel message from the channel.");
+                    Task<WorkerMessage> channelTask = channel.ReceiveAsync(channelTokenSource.Token);
 
-                // Otherwise a cancel message was received from the channel.
-                Trace.Info("Cancellation/Shutdown message received.");
-                channelMessage = await channelTask;
-                switch (channelMessage.MessageType)
-                {
-                    case MessageType.CancelRequest:
-                        jobRequestCancellationToken.Cancel();   // Expire the host cancellation token.
-                        break;
-                    case MessageType.AgentShutdown:
-                        HostContext.ShutdownAgent(ShutdownReason.UserCancelled);
-                        break;
-                    case MessageType.OperatingSystemShutdown:
-                        HostContext.ShutdownAgent(ShutdownReason.OperatingSystemShutdown);
-                        break;
-                    default:
-                        throw new ArgumentOutOfRangeException(nameof(channelMessage.MessageType), channelMessage.MessageType, nameof(channelMessage.MessageType));
+                    // Wait for one of the tasks to complete.
+                    Trace.Info("Waiting for the job to complete or for a cancel message from the channel.");
+                    await Task.WhenAny(jobRunnerTask, channelTask);
+
+                    // Handle if the job completed.
+                    if (jobRunnerTask.IsCompleted)
+                    {
+                        Trace.Info("Job completed.");
+                        channelTokenSource.Cancel(); // Cancel waiting for a message from the channel.
+                        return TaskResultUtil.TranslateToReturnCode(await jobRunnerTask);
+                    }
+
+                    // Otherwise a message was received from the channel.
+                    channelMessage = await channelTask;
+                    switch (channelMessage.MessageType)
+                    {
+                        case MessageType.CancelRequest:
+                            Trace.Info("Cancellation/Shutdown message received.");
+                            cancel = true;
+                            jobRequestCancellationToken.Cancel();   // Expire the host cancellation token.
+                            break;
+                        case MessageType.AgentShutdown:
+                            Trace.Info("Cancellation/Shutdown message received.");
+                            cancel = true;
+                            HostContext.ShutdownAgent(ShutdownReason.UserCancelled);
+                            break;
+                        case MessageType.OperatingSystemShutdown:
+                            Trace.Info("Cancellation/Shutdown message received.");
+                            cancel = true;
+                            HostContext.ShutdownAgent(ShutdownReason.OperatingSystemShutdown);
+                            break;
+                        case MessageType.JobMetadataUpdate:
+                            Trace.Info("Metadata update message received.");
+                            var metadataMessage = JsonUtility.FromString<JobMetadataMessage>(channelMessage.Body);
+                            jobRunner.UpdateMetadata(metadataMessage);
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException(nameof(channelMessage.MessageType), channelMessage.MessageType, nameof(channelMessage.MessageType));
+                    }
                 }
 
                 // Await the job.
@@ -109,7 +134,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private void AddUserSuppliedSecret(String secret)
         {
             ArgUtil.NotNull(secret, nameof(secret));
-            HostContext.SecretMasker.AddValue(secret);
+            HostContext.SecretMasker.AddValue(secret, WellKnownSecretAliases.UserSuppliedSecret);
             // for variables, it is possible that they are used inside a shell which would strip off surrounding quotes
             // so, if the value is surrounded by quotes, add a quote-timmed version of the secret to our masker as well
             // This addresses issue #2525
@@ -117,9 +142,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             {
                 if (secret.StartsWith(quoteChar) && secret.EndsWith(quoteChar))
                 {
-                    HostContext.SecretMasker.AddValue(secret.Trim(quoteChar));
+                    HostContext.SecretMasker.AddValue(secret.Trim(quoteChar), WellKnownSecretAliases.UserSuppliedSecret);
                 }
             }
+
+            // Here we add a trimmed secret value to the dictionary in case of a possible leak through external tools.
+            var trimChars = new char[] { '\r', '\n', ' ' };
+            HostContext.SecretMasker.AddValue(secret.Trim(trimChars), WellKnownSecretAliases.UserSuppliedSecret);
         }
 
         private void InitializeSecretMasker(Pipelines.AgentJobRequestMessage message)
@@ -130,15 +159,35 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             // Add mask hints for secret variables
             foreach (var variable in (message.Variables ?? new Dictionary<string, VariableValue>()))
             {
-                if (variable.Value.IsSecret && !string.IsNullOrEmpty(variable.Value.Value))
+                // Skip secrets which are just white spaces.
+                if (variable.Value.IsSecret && !string.IsNullOrWhiteSpace(variable.Value.Value))
                 {
                     AddUserSuppliedSecret(variable.Value.Value);
                     // also, we escape some characters for variables when we print them out in debug mode. We need to
                     // add the escaped version of these secrets as well
-                    var escapedSecret = variable.Value.Value.Replace("%", "%25")
+                    var escapedSecret = variable.Value.Value.Replace("%", "%AZP25")
                                                             .Replace("\r", "%0D")
                                                             .Replace("\n", "%0A");
                     AddUserSuppliedSecret(escapedSecret);
+
+                    // Since % escaping may be turned off, also mask a version escaped with just newlines
+                    var escapedSecret2 = variable.Value.Value.Replace("\r", "%0D")
+                                                             .Replace("\n", "%0A");
+                    AddUserSuppliedSecret(escapedSecret2);
+                    // We need to mask the base 64 value of the secret as well
+                    var base64Secret = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(variable.Value.Value));
+                    // Add the base64 secret to the secret masker
+                    AddUserSuppliedSecret(base64Secret);
+                    // also, we escape some characters for variables when we print them out in debug mode. We need to
+                    // add the escaped version of these secrets as well
+                    var escapedSecret3 = base64Secret.Replace("%", "%AZP25")
+                                                     .Replace("\r", "%0D")
+                                                     .Replace("\n", "%0A");
+                    AddUserSuppliedSecret(escapedSecret3);
+                    // Since % escaping may be turned off, also mask a version escaped with just newlines
+                    var escapedSecret4 = base64Secret.Replace("\r", "%0D")
+                                                     .Replace("\n", "%0A");
+                    AddUserSuppliedSecret(escapedSecret4);
                 }
             }
 
@@ -147,11 +196,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             {
                 if (maskHint.Type == MaskType.Regex)
                 {
-                    HostContext.SecretMasker.AddRegex(maskHint.Value);
+                    HostContext.SecretMasker.AddRegex(maskHint.Value, $"Worker_{WellKnownSecretAliases.AddingMaskHint}");
 
                     // We need this because the worker will print out the job message JSON to diag log
                     // and SecretMasker has JsonEscapeEncoder hook up
-                    HostContext.SecretMasker.AddValue(maskHint.Value);
+                    HostContext.SecretMasker.AddValue(maskHint.Value, WellKnownSecretAliases.AddingMaskHint);
                 }
                 else
                 {
@@ -165,11 +214,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             // Add masks for service endpoints
             foreach (ServiceEndpoint endpoint in message.Resources.Endpoints ?? new List<ServiceEndpoint>())
             {
-                foreach (string value in endpoint.Authorization?.Parameters?.Values ?? new string[0])
+                foreach (var keyValuePair in endpoint.Authorization?.Parameters ?? new Dictionary<string, string>())
                 {
-                    if (!string.IsNullOrEmpty(value))
+                    if (!string.IsNullOrEmpty(keyValuePair.Value) && MaskingUtil.IsEndpointAuthorizationParametersSecret(keyValuePair.Key))
                     {
-                        HostContext.SecretMasker.AddValue(value);
+                        HostContext.SecretMasker.AddValue(keyValuePair.Value, $"Worker_EndpointAuthorizationParameters_{keyValuePair.Key}");
                     }
                 }
             }
@@ -179,7 +228,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             {
                 if (!string.IsNullOrEmpty(file.Ticket))
                 {
-                    HostContext.SecretMasker.AddValue(file.Ticket);
+                    HostContext.SecretMasker.AddValue(file.Ticket, WellKnownSecretAliases.SecureFileTicket);
                 }
             }
         }

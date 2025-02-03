@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+using System;
 using Microsoft.VisualStudio.Services.Agent.Util;
 
 namespace Agent.Sdk.Knob
 {
-
     public class RuntimeKnobSource : IKnobSource
     {
-        private string _runTimeVar;
+        private readonly string _runTimeVar;
+
         public RuntimeKnobSource(string runTimeVar)
         {
             _runTimeVar = runTimeVar;
@@ -16,7 +17,16 @@ namespace Agent.Sdk.Knob
         public KnobValue GetValue(IKnobValueContext context)
         {
             ArgUtil.NotNull(context, nameof(context));
-            var value = context.GetVariableValueOrDefault(_runTimeVar);
+            string value = null;
+            try
+            {
+                value = context.GetVariableValueOrDefault(_runTimeVar);
+            }
+            catch (NotSupportedException)
+            {
+                throw new NotSupportedException($"{GetType().Name} not supported for context type {context.GetType()}");
+            }
+
             if (!string.IsNullOrEmpty(value))
             {
                 return new KnobValue(value, this);
@@ -29,5 +39,4 @@ namespace Agent.Sdk.Knob
             return $"$({_runTimeVar})";
         }
     }
-
 }

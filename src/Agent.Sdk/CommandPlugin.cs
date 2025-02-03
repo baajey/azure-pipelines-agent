@@ -14,9 +14,11 @@ using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.WebApi;
 using Newtonsoft.Json;
+using Agent.Sdk.Knob;
 
 namespace Agent.Sdk
 {
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1716: Identifiers should not match keywords")]
     public interface IAgentCommandPlugin
     {
         String Area { get; }
@@ -66,7 +68,7 @@ namespace Agent.Sdk
 #if DEBUG
             Debug(message);
 #else
-            string vstsAgentTrace = Environment.GetEnvironmentVariable("VSTSAGENT_TRACE");
+            string vstsAgentTrace = AgentKnobs.TraceVerbose.GetValue(UtilKnobValueContext.Instance()).AsString();
             if (!string.IsNullOrEmpty(vstsAgentTrace))
             {
                 Debug(message);
@@ -120,6 +122,7 @@ namespace Agent.Sdk
             }
 
             var certSetting = GetCertConfiguration();
+            bool skipServerCertificateValidation = false;
             if (certSetting != null)
             {
                 if (!string.IsNullOrEmpty(certSetting.ClientCertificateArchiveFile))
@@ -129,6 +132,7 @@ namespace Agent.Sdk
 
                 if (certSetting.SkipServerCertificateValidation)
                 {
+                    skipServerCertificateValidation = true;
                     VssClientHttpRequestSettings.Default.ServerCertificateValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
                 }
             }
@@ -148,7 +152,7 @@ namespace Agent.Sdk
 
             VssCredentials credentials = VssUtil.GetVssCredential(systemConnection);
             ArgUtil.NotNull(credentials, nameof(credentials));
-            return VssUtil.CreateConnection(systemConnection.Url, credentials);
+            return VssUtil.CreateConnection(systemConnection.Url, credentials, trace: this, skipServerCertificateValidation);
         }
 
         private AgentCertificateSettings GetCertConfiguration()
@@ -185,12 +189,12 @@ namespace Agent.Sdk
 
         private AgentWebProxySettings GetProxyConfiguration()
         {
-            string proxyUrl = this.Variables.GetValueOrDefault("Agent.ProxyUrl")?.Value;
+            string proxyUrl = this.Variables.GetValueOrDefault(AgentWebProxySettings.AgentProxyUrlKey)?.Value;
             if (!string.IsNullOrEmpty(proxyUrl))
             {
-                string proxyUsername = this.Variables.GetValueOrDefault("Agent.ProxyUsername")?.Value;
-                string proxyPassword = this.Variables.GetValueOrDefault("Agent.ProxyPassword")?.Value;
-                List<string> proxyBypassHosts = StringUtil.ConvertFromJson<List<string>>(this.Variables.GetValueOrDefault("Agent.ProxyBypassList")?.Value ?? "[]");
+                string proxyUsername = this.Variables.GetValueOrDefault(AgentWebProxySettings.AgentProxyUsernameKey)?.Value;
+                string proxyPassword = this.Variables.GetValueOrDefault(AgentWebProxySettings.AgentProxyPasswordKey)?.Value;
+                List<string> proxyBypassHosts = StringUtil.ConvertFromJson<List<string>>(this.Variables.GetValueOrDefault(AgentWebProxySettings.AgentProxyBypassListKey)?.Value ?? "[]");
                 return new AgentWebProxySettings()
                 {
                     ProxyAddress = proxyUrl,

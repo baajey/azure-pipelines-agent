@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -26,6 +27,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Capabilities
             "TERM_PROGRAM",
             "TERM_PROGRAM_VERSION",
             "SHLVL",
+            //This some be set by the standard powershell host initialisation. There are some  
+            //tools that set this resulting in the standard powershell initialisation failing
+            "PSMODULEPATH",
             // the agent doesn't set this, but we have seen instances in the wild where
             // a customer has pre-configured this somehow. it's almost certain to contain
             // secrets that shouldn't be exposed as capabilities, so for defense in depth,
@@ -66,6 +70,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Capabilities
                 }
             }
 
+            var secretKnobs = Knob.GetAllKnobsFor<AgentKnobs>().Where(k => k is SecretKnob);
+
             // Get filtered env vars.
             IEnumerable<string> names =
                 variables.Keys
@@ -81,6 +87,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Capabilities
                     continue;
                 }
 
+                if (secretKnobs.Any(k => k.Source.HasSourceWithTypeEnvironmentByName(name)))
+                {
+                    HostContext.SecretMasker.AddValue(value, $"EnvironmentCapabilitiesProvider_GetCapabilitiesAsync_{name}");
+                }
                 Trace.Info($"Adding '{name}': '{value}'");
                 capabilities.Add(new Capability(name, value));
             }

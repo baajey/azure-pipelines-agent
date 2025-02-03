@@ -3,18 +3,16 @@
 
 using Microsoft.TeamFoundation.TestManagement.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.VisualStudio.Services.Agent.Worker.TestResults;
+using Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils;
+using Microsoft.VisualStudio.Services.WebApi;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.VisualStudio.Services.WebApi;
-using Microsoft.TeamFoundation.DistributedTask.WebApi;
-using Microsoft.VisualStudio.Services.Agent.Worker.Telemetry;
-using Microsoft.VisualStudio.Services.WebPlatform;
 using TestRunContext = Microsoft.TeamFoundation.TestClient.PublishTestResults.TestRunContext;
-using Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 {
@@ -38,7 +36,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
         private int _runCounter = 0;
         private IFeatureFlagService _featureFlagService;
         private bool _calculateTestRunSummary;
+        private bool _isFlakyCheckEnabled;
         private string _testRunner;
+        private ITestResultsServer _testResultsServer;
+        private TestRunDataPublisherHelper _testRunPublisherHelper;
 
         public void InitializePublisher(IExecutionContext context, string projectName, VssConnection connection, string testRunner, bool publishRunLevelAttachments)
         {
@@ -49,8 +50,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             _resultReader = GetTestResultReader(_testRunner, publishRunLevelAttachments);
             _testRunPublisher = HostContext.GetService<ITestRunPublisher>();
             _featureFlagService = HostContext.GetService<IFeatureFlagService>();
+            _featureFlagService.InitializeFeatureService(_executionContext, connection);
             _testRunPublisher.InitializePublisher(_executionContext, connection, projectName, _resultReader);
+            _testResultsServer = HostContext.GetService<ITestResultsServer>();
+            _testResultsServer.InitializeServer(connection, _executionContext);
             _calculateTestRunSummary = _featureFlagService.GetFeatureFlagState(TestResultsConstants.CalculateTestRunSummaryFeatureFlag, TestResultsConstants.TFSServiceInstanceGuid);
+            _isFlakyCheckEnabled = _featureFlagService.GetFeatureFlagState(TestResultsConstants.EnableFlakyCheckInAgentFeatureFlag, TestResultsConstants.TCMServiceInstanceGuid);
+            _testRunPublisherHelper = new TestRunDataPublisherHelper(_executionContext, null, _testRunPublisher, _testResultsServer);
             Trace.Leaving();
         }
 
@@ -200,14 +206,28 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 
                     TestRun testRun = await publisher.StartTestRunAsync(testRunData, _executionContext.CancellationToken);
                     await publisher.AddResultsAsync(testRun, runResults.ToArray(), _executionContext.CancellationToken);
-                    await publisher.EndTestRunAsync(testRunData, testRun.Id, true, _executionContext.CancellationToken);
-                }
+                    TestRun updatedRun = await publisher.EndTestRunAsync(testRunData, testRun.Id, true, _executionContext.CancellationToken);
 
-                StoreTestRunSummaryInEnvVar(testRunSummary);
+                    // Check failed results for flaky aware
+                    // Fallback to flaky aware if there are any failures.
+                    if (isTestRunOutcomeFailed && _isFlakyCheckEnabled)
+                    {
+                        IList<TestRun> publishedRuns = new List<TestRun>();
+                        publishedRuns.Add(updatedRun);
+                        var runOutcome = _testRunPublisherHelper.CheckRunsForFlaky(publishedRuns, _projectName);
+                        if (runOutcome != null && runOutcome.HasValue)
+                        {
+                            isTestRunOutcomeFailed = runOutcome.Value;
+                        }
+                    }
+
+                    StoreTestRunSummaryInEnvVar(testRunSummary);
+                }
             }
-            catch (Exception ex) when (!(ex is OperationCanceledException))
+            catch (Exception ex) when (!(ex is OperationCanceledException && _executionContext.CancellationToken.IsCancellationRequested))
             {
-                //Do not fail the task.
+                // Not catching all the operationcancelled exceptions, as the pipeline cancellation should cancel the command as well.
+                // Do not fail the task.
                 LogPublishTestResultsFailureWarning(ex);
             }
             return isTestRunOutcomeFailed;
@@ -216,7 +236,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
         private void StoreTestRunSummaryInEnvVar(TestRunSummary testRunSummary)
         {
             // Storing testrun summary in environment variable, which will be read by PublishPipelineMetadataTask and publish to evidence store.
-            if(_calculateTestRunSummary)
+            if (_calculateTestRunSummary)
             {
                 TestResultUtils.StoreTestRunSummaryInEnvVar(_executionContext, testRunSummary, _testRunner, "PublishTestResults");
             }
@@ -236,15 +256,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             bool isTestRunOutcomeFailed = false;
             try
             {
+                IList<TestRun> publishedRuns = new List<TestRun>();
                 var groupedFiles = resultFiles
-                    .Select((resultFile, index) => new { Index = index, file = resultFile })
-                    .GroupBy(pair => pair.Index / batchSize)
-                    .Select(bucket => bucket.Select(pair => pair.file).ToList())
-                    .ToList();
+                .Select((resultFile, index) => new { Index = index, file = resultFile })
+                .GroupBy(pair => pair.Index / batchSize)
+                .Select(bucket => bucket.Select(pair => pair.file).ToList())
+                .ToList();
 
                 bool changeTestRunTitle = resultFiles.Count > 1;
                 TestRunSummary testRunSummary = new TestRunSummary();
-
                 foreach (var files in groupedFiles)
                 {
                     // Publish separate test run for each result file that has results.
@@ -268,13 +288,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 
                         if (testRunData != null)
                         {
-                            if (testRunData.Results != null && testRunData.Results.Length > 0)
+                            if (testRunData.Results != null)
                             {
                                 testRunData.AddCustomField(_testRunSystemCustomFieldName, runContext.TestRunSystem);
                                 AddTargetBranchInfoToRunCreateModel(testRunData, runContext.TargetBranchName);
                                 TestRun testRun = await publisher.StartTestRunAsync(testRunData, _executionContext.CancellationToken);
                                 await publisher.AddResultsAsync(testRun, testRunData.Results, _executionContext.CancellationToken);
-                                await publisher.EndTestRunAsync(testRunData, testRun.Id, cancellationToken: _executionContext.CancellationToken);
+                                TestRun updatedRun = await publisher.EndTestRunAsync(testRunData, testRun.Id, cancellationToken: _executionContext.CancellationToken);
+
+                                publishedRuns.Add(updatedRun);
                             }
                             else
                             {
@@ -289,11 +311,23 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
                     await Task.WhenAll(publishTasks);
                 }
 
+                // Check failed results for flaky aware
+                // Fallback to flaky aware if there are any failures.
+                if (isTestRunOutcomeFailed && _isFlakyCheckEnabled)
+                {
+                    var runOutcome = _testRunPublisherHelper.CheckRunsForFlaky(publishedRuns, _projectName);
+                    if (runOutcome != null && runOutcome.HasValue)
+                    {
+                        isTestRunOutcomeFailed = runOutcome.Value;
+                    }
+                }
+
                 StoreTestRunSummaryInEnvVar(testRunSummary);
             }
-            catch (Exception ex) when (!(ex is OperationCanceledException))
+            catch (Exception ex) when (!(ex is OperationCanceledException && _executionContext.CancellationToken.IsCancellationRequested))
             {
-                //Do not fail the task.
+                // Not catching all the operationcancelled exceptions, as the pipeline cancellation should cancel the command as well.
+                // Do not fail the task.
                 LogPublishTestResultsFailureWarning(ex);
             }
             return isTestRunOutcomeFailed;
@@ -301,7 +335,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 
         private string GetRunName(string runTitle)
         {
-             lock (_sync)
+            lock (_sync)
             {
                 return StringUtil.Format("{0}_{1}", runTitle, ++_runCounter);
             }
@@ -345,11 +379,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
         private bool GetTestRunOutcome(TestRunData testRunData, TestRunSummary testRunSummary)
         {
             bool anyFailedTests = false;
-            foreach(var testCaseResultData in testRunData.Results)
+            foreach (var testCaseResultData in testRunData.Results)
             {
                 testRunSummary.Total += 1;
                 Enum.TryParse(testCaseResultData.Outcome, out TestOutcome outcome);
-                switch(outcome)
+                switch (outcome)
                 {
                     case TestOutcome.Failed:
                     case TestOutcome.Aborted:
@@ -365,7 +399,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
                     default: break;
                 }
 
-                if(!_calculateTestRunSummary && anyFailedTests)
+                if (!_calculateTestRunSummary && anyFailedTests)
                 {
                     return anyFailedTests;
                 }

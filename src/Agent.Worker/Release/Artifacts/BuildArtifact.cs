@@ -56,8 +56,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts
 
             // Get the list of available artifacts from build.
             executionContext.Output(StringUtil.Loc("RMPreparingToGetBuildArtifactList"));
+            bool skipServerCertificateValidation = executionContext.Variables.Agent_SslSkipCertValidation ?? false;
 
-            using (var vssConnection = VssUtil.CreateConnection(buildArtifactDetails.TfsUrl, buildArtifactDetails.Credentials))
+            using (var vssConnection = VssUtil.CreateConnection(buildArtifactDetails.TfsUrl, buildArtifactDetails.Credentials, trace: Trace, skipServerCertificateValidation))
             {
                 var buildClient = vssConnection.GetClient<BuildHttpClient>();
                 var xamlBuildClient = vssConnection.GetClient<XamlBuildHttpClient>();
@@ -128,13 +129,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts
             if (artifactDetails.TryGetValue("RelativePath", out relativePath))
             {
                 var buildArtifactDetails = new BuildArtifactDetails
-                    {
-                        Credentials = vssCredentials,
-                        RelativePath = artifactDetails["RelativePath"],
-                        AccessToken = accessToken,
-                        Project = projectId.ToString(),
-                        TfsUrl = new Uri(tfsUrl)
-                    };
+                {
+                    Credentials = vssCredentials,
+                    RelativePath = artifactDetails["RelativePath"],
+                    AccessToken = accessToken,
+                    Project = projectId.ToString(),
+                    TfsUrl = new Uri(tfsUrl)
+                };
 
                 if (artifactDetails.ContainsKey("DefinitionName"))
                 {
@@ -247,16 +248,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts
 
                 executionContext.Output(StringUtil.Loc("RMParallelDownloadLimit", containerFetchEngineOptions.ParallelDownloadLimit));
                 executionContext.Output(StringUtil.Loc("RMDownloadBufferSize", containerFetchEngineOptions.DownloadBufferSize));
+                bool skipServerCertificateValidation = executionContext.Variables.Agent_SslSkipCertValidation ?? false;
 
-                using (var containerProviderFactory = new ContainerProviderFactory(buildArtifactDetails, rootLocation, containerId, executionContext))
+                IContainerProvider containerProvider =
+                    new ContainerProviderFactory(buildArtifactDetails, rootLocation, containerId, executionContext).GetContainerProvider(
+                    ArtifactResourceTypes.Container, skipServerCertificateValidation);
+
+                using (var engine = new ContainerFetchEngine.ContainerFetchEngine(containerProvider, rootLocation, rootDestinationDir))
                 {
-                    var containerProvider = containerProviderFactory.GetContainerProvider(ArtifactResourceTypes.Container);
-                    using (var engine = new ContainerFetchEngine.ContainerFetchEngine(containerProvider, rootLocation, rootDestinationDir))
-                    {
-                        engine.ContainerFetchEngineOptions = containerFetchEngineOptions;
-                        engine.ExecutionLogger = new ExecutionLogger(executionContext);
-                        await engine.FetchAsync(executionContext.CancellationToken);
-                    }
+                    engine.ContainerFetchEngineOptions = containerFetchEngineOptions;
+                    engine.ExecutionLogger = new ExecutionLogger(executionContext);
+                    await engine.FetchAsync(executionContext.CancellationToken);
                 }
             }
             else

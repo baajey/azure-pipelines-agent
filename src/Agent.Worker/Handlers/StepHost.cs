@@ -31,6 +31,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                Encoding outputEncoding,
                                bool killProcessOnCancel,
                                bool inheritConsoleHandler,
+                               bool continueAfterCancelProcessTreeKillAttempt,
+                               TimeSpan sigintTimeout,
+                               TimeSpan sigtermTimeout,
+                               bool useGracefulShutdown,
                                CancellationToken cancellationToken);
     }
 
@@ -64,12 +68,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                             Encoding outputEncoding,
                                             bool killProcessOnCancel,
                                             bool inheritConsoleHandler,
+                                            bool continueAfterCancelProcessTreeKillAttempt,
+                                            TimeSpan sigintTimeout,
+                                            TimeSpan sigtermTimeout,
+                                            bool useGracefulShutdown,
                                             CancellationToken cancellationToken)
         {
             using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
             {
                 processInvoker.OutputDataReceived += OutputDataReceived;
                 processInvoker.ErrorDataReceived += ErrorDataReceived;
+                processInvoker.SigintTimeout = sigintTimeout;
+                processInvoker.SigtermTimeout = sigtermTimeout;
+                processInvoker.TryUseGracefulShutdown = useGracefulShutdown;
 
                 return await processInvoker.ExecuteAsync(workingDirectory: workingDirectory,
                                                          fileName: fileName,
@@ -80,6 +91,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                                          killProcessOnCancel: killProcessOnCancel,
                                                          redirectStandardIn: null,
                                                          inheritConsoleHandler: inheritConsoleHandler,
+                                                         continueAfterCancelProcessTreeKillAttempt: continueAfterCancelProcessTreeKillAttempt,
                                                          cancellationToken: cancellationToken);
             }
         }
@@ -106,7 +118,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             StringComparison sc = (PlatformUtil.RunningOnWindows)
                                 ? StringComparison.OrdinalIgnoreCase
                                 : StringComparison.Ordinal;
-            if (Container.MountVolumes.Exists(x => {
+            if (Container.MountVolumes.Exists(x =>
+            {
                 if (!string.IsNullOrEmpty(x.SourceVolumePath))
                 {
                     return path.StartsWith(x.SourceVolumePath, sc);
@@ -134,6 +147,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                             Encoding outputEncoding,
                                             bool killProcessOnCancel,
                                             bool inheritConsoleHandler,
+                                            bool continueAfterCancelProcessTreeKillAttempt,
+                                            TimeSpan sigintTimeout,
+                                            TimeSpan sigtermTimeout,
+                                            bool useGracefulShutdown,
                                             CancellationToken cancellationToken)
         {
             // make sure container exist.
@@ -165,24 +182,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             HostContext.GetTrace(nameof(ContainerStepHost)).Info($"Copying containerHandlerInvoker.js to {tempDir}");
             File.Copy(Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Bin), "containerHandlerInvoker.js.template"), targetEntryScript, true);
 
-            string node;
-            if (!string.IsNullOrEmpty(Container.CustomNodePath))
-            {
-                node = Container.CustomNodePath;
-            }
-            else
-            {
-                node = Container.TranslateToContainerPath(Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "node", "bin", $"node{IOUtil.ExeExtension}"));
-            }
-
             string entryScript = Container.TranslateContainerPathForImageOS(PlatformUtil.HostOS, Container.TranslateToContainerPath(targetEntryScript));
 
             string userArgs = "";
+            string workingDirectoryParam = "";
             if (!PlatformUtil.RunningOnWindows)
             {
                 userArgs = $"-u {Container.CurrentUserId}";
+                if (Container.CurrentUserName == "root")
+                {
+                    workingDirectoryParam = $" -w /root";
+                }
+                else
+                {
+                    workingDirectoryParam = $" -w /home/{Container.CurrentUserName}";
+                }
             }
-            string containerExecutionArgs = $"exec -i {userArgs} {Container.ContainerId} {node} {entryScript}";
+
+            string containerExecutionArgs = $"exec -i {userArgs} {workingDirectoryParam} {Container.ContainerId} {Container.ResultNodePath} {entryScript}";
 
             using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
             {
@@ -190,13 +207,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                 processInvoker.ErrorDataReceived += ErrorDataReceived;
                 outputEncoding = null; // Let .NET choose the default.
 
+                processInvoker.SigintTimeout = sigintTimeout;
+                processInvoker.SigtermTimeout = sigtermTimeout;
+                processInvoker.TryUseGracefulShutdown = useGracefulShutdown;
+
                 if (PlatformUtil.RunningOnWindows)
                 {
                     // It appears that node.exe outputs UTF8 when not in TTY mode.
                     outputEncoding = Encoding.UTF8;
                 }
 
-                var redirectStandardIn = new InputQueue<string>();
+                using var redirectStandardIn = new InputQueue<string>();
                 var payloadJson = JsonUtility.ToString(payload);
                 redirectStandardIn.Enqueue(payloadJson);
                 HostContext.GetTrace(nameof(ContainerStepHost)).Info($"Payload: {payloadJson}");
@@ -209,6 +230,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                                          killProcessOnCancel: killProcessOnCancel,
                                                          redirectStandardIn: redirectStandardIn,
                                                          inheritConsoleHandler: inheritConsoleHandler,
+                                                         continueAfterCancelProcessTreeKillAttempt: continueAfterCancelProcessTreeKillAttempt,
                                                          cancellationToken: cancellationToken);
             }
         }

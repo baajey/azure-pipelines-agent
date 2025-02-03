@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-﻿using Microsoft.TeamFoundation.TestManagement.WebApi;
+using Microsoft.TeamFoundation.TestManagement.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.WebApi;
 using System;
@@ -80,11 +80,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             DateTime runFinishDate = DateTime.MinValue;
             if (node != null && node.Attributes["start"] != null && node.Attributes["finish"] != null)
             {
-                if (DateTime.TryParse(node.Attributes["start"].Value, DateTimeFormatInfo.InvariantInfo,DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out runStartDate))
+                if (DateTime.TryParse(node.Attributes["start"].Value, DateTimeFormatInfo.InvariantInfo, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out runStartDate))
                 {
                     _executionContext.Debug(string.Format(CultureInfo.InvariantCulture, "Setting run start and finish times."));
                     //Only if there is a valid start date.
-                    DateTime.TryParse(node.Attributes["finish"].Value, DateTimeFormatInfo.InvariantInfo,DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out runFinishDate);
+                    DateTime.TryParse(node.Attributes["finish"].Value, DateTimeFormatInfo.InvariantInfo, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out runFinishDate);
                     if (runFinishDate < runStartDate)
                     {
                         runFinishDate = runStartDate = DateTime.MinValue;
@@ -111,7 +111,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             //Parse the Deployment node for the runDeploymentRoot - this is the attachment root. Required for .NET Core
             XmlNode deploymentNode = doc.SelectSingleNode("/TestRun/TestSettings/Deployment");
             var _attachmentRoot = string.Empty;
-            if (deploymentNode != null && deploymentNode.Attributes["runDeploymentRoot"] != null )
+            if (deploymentNode != null && deploymentNode.Attributes["runDeploymentRoot"] != null)
             {
                 _attachmentRoot = deploymentNode.Attributes["runDeploymentRoot"].Value;
             }
@@ -156,14 +156,27 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
                     // set it as "name" from the parent (where it is always present)
                     XmlNode testResultNode = definitionNode.SelectSingleNode("./TestMethod");
                     string automatedTestName = null;
-                    if (testResultNode != null && testResultNode.Attributes["className"] != null && testResultNode.Attributes["name"] != null)
+                    if (testResultNode != null && testResultNode.Attributes["className"] != null && (definitionNode.Attributes["name"]?.Value != null || testResultNode.Attributes["name"] != null))
                     {
                         // At times the class names are coming as
                         // className="MS.TF.Test.AgileX.VSTests.WiLinking.UI.WiLinkingUIQueryTests"
                         // at other times, they are as
                         // className="UnitTestProject3.UnitTest1, UnitTestProject3, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null"
                         string className = testResultNode.Attributes["className"].Value.Split(',')[0];
-                        automatedTestName = className + "." + testResultNode.Attributes["name"].Value;
+
+                        string testCaseName;
+                        //For Datadriven tests definitionNode:name is unique whereas testResultnode:name is not
+                        //And for non DataDriven tests both definitionNode:name and testResultnode:name will be same
+                        if (definitionNode.Attributes["name"]?.Value != null)
+                        {
+                            testCaseName = definitionNode.Attributes["name"].Value;
+                        }
+                        else
+                        {
+                            testCaseName = testResultNode.Attributes["name"].Value;
+                        }
+
+                        automatedTestName = className + "." + testCaseName;
                     }
                     else if (definitionNode.Attributes["name"] != null)
                     {
@@ -309,17 +322,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
                 DateTime completedDate = startedDate.AddTicks(duration.Ticks);
                 resultCreateModel.CompletedDate = completedDate;
 
-                if ((DateTime.Compare(default(DateTime), startedDate) < 0 && DateTime.Compare(startedDate, (DateTime) SqlDateTime.MinValue) <= 0)
-                    || (DateTime.Compare(default(DateTime), completedDate) < 0 && DateTime.Compare(completedDate, (DateTime) SqlDateTime.MinValue) <= 0)) {
+                if ((DateTime.Compare(default(DateTime), startedDate) < 0 && DateTime.Compare(startedDate, (DateTime)SqlDateTime.MinValue) <= 0)
+                    || (DateTime.Compare(default(DateTime), completedDate) < 0 && DateTime.Compare(completedDate, (DateTime)SqlDateTime.MinValue) <= 0))
+                {
 
-                        DateTime utcNow = DateTime.UtcNow;
-                        resultCreateModel.StartedDate = utcNow;
-                        resultCreateModel.CompletedDate = utcNow.AddTicks(duration.Ticks);
+                    DateTime utcNow = DateTime.UtcNow;
+                    resultCreateModel.StartedDate = utcNow;
+                    resultCreateModel.CompletedDate = utcNow.AddTicks(duration.Ticks);
                 }
 
                 if (resultNode.Attributes["outcome"] == null || resultNode.Attributes["outcome"].Value == null || string.Equals(resultNode.Attributes["outcome"].Value, "failed", StringComparison.OrdinalIgnoreCase))
                 {
-                    resultCreateModel.Outcome = TestOutcome.Failed.ToString(); ;
+                    resultCreateModel.Outcome = TestOutcome.Failed.ToString();
                 }
                 else if (string.Equals(resultNode.Attributes["outcome"].Value, "passed", StringComparison.OrdinalIgnoreCase))
                 {
@@ -509,7 +523,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 
                 if (resultNode.Attributes["outcome"] == null || resultNode.Attributes["outcome"].Value == null || string.Equals(resultNode.Attributes["outcome"].Value, "failed", StringComparison.OrdinalIgnoreCase))
                 {
-                    resultCreateModel.Outcome = TestOutcome.Failed.ToString(); ;
+                    resultCreateModel.Outcome = TestOutcome.Failed.ToString();
                 }
                 else if (string.Equals(resultNode.Attributes["outcome"].Value, "passed", StringComparison.OrdinalIgnoreCase))
                 {
@@ -582,7 +596,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
 
                     resultCreateModel.SubResultData = new List<TestCaseSubResultData>();
 
-                    resultCreateModel.SubResultData.AddRange(ReadActualSubResults(resNodes, TestType.UnitTest, level+1));
+                    resultCreateModel.SubResultData.AddRange(ReadActualSubResults(resNodes, TestType.UnitTest, level + 1));
                     resultCreateModel.SubResultData.AddRange(ReadActualSubResults(webTestResultNodes, TestType.WebTest, level + 1));
                     resultCreateModel.SubResultData.AddRange(ReadActualSubResults(orderedTestResultNodes, TestType.OrderedTest, level + 1));
                 }
@@ -664,7 +678,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             if (testType == TestType.OrderedTest)
             {
                 return ResultGroupType.OrderedTest;
-            } else
+            }
+            else
             {
                 if (resultNode.Attributes["resultType"]?.Value != null && resultNode.Attributes["resultType"]?.Value == "DataDrivenTest")
                 {

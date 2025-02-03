@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Microsoft.VisualStudio.Services.WebApi;
 using System.Xml;
 using Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk.Knob;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 {
@@ -81,7 +82,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             }
 
             // Initialize our Azure Support (imports the module, sets up the Azure subscription)
-            string path = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "vstshost");
+            string path = AgentKnobs.InstallLegacyTfExe.GetValue(ExecutionContext).AsBoolean()
+                ? Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "vstshost-legacy")
+                : Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), "vstshost");
+
             string azurePSM1 = Path.Combine(path, "Microsoft.TeamFoundation.DistributedTask.Task.Deployment.Azure\\Microsoft.TeamFoundation.DistributedTask.Task.Deployment.Azure.psm1");
 
             Trace.Verbose("AzurePowerShellHandler.UpdatePowerShellEnvironment - AddCommand(Import-Module)");
@@ -123,14 +127,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                 Trace.Verbose("AzurePowerShellHandler.UpdatePowerShellEnvironment - Could not find {0}, so looking for DeploymentEnvironmentName.", connectedServiceName);
                 if (!inputs.TryGetValue("DeploymentEnvironmentName", out environment))
                 {
-                    throw new Exception($"The required {connectedServiceName} parameter was not found by the AzurePowerShellRunner.");
+                    throw new ArgumentNullException($"The required {connectedServiceName} parameter was not found by the AzurePowerShellRunner.");
                 }
             }
 
             string connectedServiceNameValue = environment;
             if (String.IsNullOrEmpty(connectedServiceNameValue))
             {
-                throw new Exception($"The required {connectedServiceName} parameter was either null or empty. Ensure you have provisioned a Deployment Environment using services tab in Admin UI.");
+                throw new ArgumentNullException($"The required {connectedServiceName} parameter was either null or empty. Ensure you have provisioned a Deployment Environment using services tab in Admin UI.");
             }
 
             return connectedServiceNameValue;
@@ -205,9 +209,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 
             // Copy the OM binaries into the legacy host folder.
             ExecutionContext.Output(StringUtil.Loc("PrepareTaskExecutionHandler"));
+
+            string sourceDirectory = AgentKnobs.InstallLegacyTfExe.GetValue(ExecutionContext).AsBoolean()
+                ? HostContext.GetDirectory(WellKnownDirectory.ServerOMLegacy)
+                : HostContext.GetDirectory(WellKnownDirectory.ServerOM);
+
+            string targetDirectory = AgentKnobs.InstallLegacyTfExe.GetValue(ExecutionContext).AsBoolean()
+                ? HostContext.GetDirectory(WellKnownDirectory.LegacyPSHostLegacy)
+                : HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost);
+
             IOUtil.CopyDirectory(
-                source: HostContext.GetDirectory(WellKnownDirectory.ServerOM),
-                target: HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost),
+                source: sourceDirectory,
+                target: targetDirectory,
                 cancellationToken: ExecutionContext.CancellationToken);
             Trace.Info("Finished copying files.");
 
@@ -230,7 +243,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 
                 try
                 {
-                    String vstsPSHostExe = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost), "LegacyVSTSPowerShellHost.exe");
+                    String vstsPSHostExeDirectory = AgentKnobs.InstallLegacyTfExe.GetValue(ExecutionContext).AsBoolean()
+                        ? HostContext.GetDirectory(WellKnownDirectory.LegacyPSHostLegacy)
+                        : HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost);
+
+                    String vstsPSHostExe = Path.Combine(vstsPSHostExeDirectory, "LegacyVSTSPowerShellHost.exe");
                     Int32 exitCode = await processInvoker.ExecuteAsync(workingDirectory: workingDirectory,
                                                                        fileName: vstsPSHostExe,
                                                                        arguments: "",
@@ -240,6 +257,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                                                        killProcessOnCancel: false,
                                                                        redirectStandardIn: null,
                                                                        inheritConsoleHandler: !ExecutionContext.Variables.Retain_Default_Encoding,
+                                                                       continueAfterCancelProcessTreeKillAttempt: _continueAfterCancelProcessTreeKillAttempt,
                                                                        cancellationToken: ExecutionContext.CancellationToken);
 
                     // the exit code from vstsPSHost.exe indicate how many error record we get during execution
@@ -318,7 +336,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                         }
                         else
                         {
-                            throw new Exception($"Found value {match.Value} with no corresponding named parameter");
+                            throw new ArgumentException($"Found value {match.Value} with no corresponding named parameter");
                         }
                     }
                 }
@@ -346,13 +364,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             // push all variable.
             foreach (var variable in ExecutionContext.Variables.Public.Concat(ExecutionContext.Variables.Private))
             {
-                AddEnvironmentVariable("VSTSPSHOSTVAR_" + variable.Key, variable.Value);
+                AddEnvironmentVariable("VSTSPSHOSTVAR_" + variable.Name, variable.Value);
             }
 
             // push all public variable.
             foreach (var variable in ExecutionContext.Variables.Public)
             {
-                AddEnvironmentVariable("VSTSPSHOSTPUBVAR_" + variable.Key, variable.Value);
+                AddEnvironmentVariable("VSTSPSHOSTPUBVAR_" + variable.Name, variable.Value);
             }
 
             // push all endpoints
@@ -431,10 +449,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 
         private void AddProxySetting(IVstsAgentWebProxy agentProxy)
         {
-            string appConfig = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost), _appConfigFileName);
+            string psHostDirectory = AgentKnobs.InstallLegacyTfExe.GetValue(ExecutionContext).AsBoolean()
+                ? HostContext.GetDirectory(WellKnownDirectory.LegacyPSHostLegacy)
+                : HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost);
+
+            string appConfig = Path.Combine(psHostDirectory, _appConfigFileName);
+
             ArgUtil.File(appConfig, _appConfigFileName);
 
-            string appConfigRestore = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.LegacyPSHost), _appConfigRestoreFileName);
+            string appConfigRestore = Path.Combine(psHostDirectory, _appConfigRestoreFileName);
             if (!File.Exists(appConfigRestore))
             {
                 Trace.Info("Take snapshot of current appconfig for restore modified appconfig.");

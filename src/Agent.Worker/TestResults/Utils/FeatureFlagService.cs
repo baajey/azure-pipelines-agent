@@ -18,7 +18,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
         bool GetFeatureFlagState(string featureFlagName, Guid serviceInstanceId);
     }
 
-    public class FeatureFlagService :  AgentService, IFeatureFlagService
+    public class FeatureFlagService : AgentService, IFeatureFlagService
     {
         private IExecutionContext _executionContext;
         private VssConnection _connection;
@@ -39,12 +39,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
                 var featureFlag = featureAvailabilityHttpClient?.GetFeatureFlagByNameAsync(featureFlagName).Result;
                 if (featureFlag != null && featureFlag.EffectiveState.Equals("On", StringComparison.OrdinalIgnoreCase))
                 {
+                    _executionContext.Debug(StringUtil.Format("{0} is on", featureFlagName));
                     return true;
                 }
+                _executionContext.Debug(StringUtil.Format("{0} is off", featureFlagName));
             }
-            catch
+            catch(Exception ex)
             {
-                _executionContext.Debug(StringUtil.Format("Failed to get FF {0} Value.", featureFlagName));
+                var exceptionMessage = StringUtil.Format("Failed to get FF {0} Value. Error: {1}", featureFlagName, ex.ToString());
+                _executionContext.Warning(exceptionMessage);
+                Trace.Error(exceptionMessage);
             }
             return false;
         }

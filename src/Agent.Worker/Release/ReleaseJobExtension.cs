@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
@@ -15,6 +16,10 @@ using Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts;
 using Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts.Definition;
 using Newtonsoft.Json;
 using Microsoft.TeamFoundation.DistributedTask.Pipelines;
+
+using Agent.Sdk;
+using Agent.Sdk.Knob;
+using Agent.Sdk.Util;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
 {
@@ -35,6 +40,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
 
         public override Type ExtensionType => typeof(IJobExtension);
         public override HostTypes HostType => HostTypes.Release;
+
+        private TeeUtil teeUtil;
 
         public override IStep GetExtensionPreJobStep(IExecutionContext jobContext)
         {
@@ -123,6 +130,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
                 await DownloadArtifacts(executionContext, ReleaseArtifacts, ArtifactsWorkingFolder);
                 await DownloadCommits(executionContext, TeamProjectId, ReleaseArtifacts);
             }
+            catch (SocketException ex)
+            {
+                LogDownloadFailureTelemetry(executionContext, ex);
+
+                ExceptionsUtil.HandleSocketException(ex, WorkerUtilities.GetVssConnection(executionContext).Uri.ToString(), Trace.Error);
+                throw;
+            }
             catch (Exception ex)
             {
                 LogDownloadFailureTelemetry(executionContext, ex);
@@ -130,20 +144,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
             }
         }
 
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Maintainability", "CA2000:Dispose objects before losing scope", MessageId = "releaseServer")]
         private IList<AgentArtifactDefinition> GetReleaseArtifacts(IExecutionContext executionContext)
         {
             try
             {
-                using (var connection = WorkerUtilities.GetVssConnection(executionContext))
-                {
-                    var releaseServer = executionContext.GetHostContext().GetService<IReleaseServer>();
-                    releaseServer.ConnectAsync(connection).GetAwaiter().GetResult();
+                var connection = WorkerUtilities.GetVssConnection(executionContext);
+                var releaseServer = executionContext.GetHostContext().GetService<IReleaseServer>();
+                releaseServer.ConnectAsync(connection).GetAwaiter().GetResult();
 
-                    IList<AgentArtifactDefinition> releaseArtifacts = releaseServer.GetReleaseArtifactsFromService(ReleaseId, TeamProjectId).ToList();
-                    IList<AgentArtifactDefinition> filteredReleaseArtifacts = FilterArtifactDefintions(releaseArtifacts);
-                    filteredReleaseArtifacts.ToList().ForEach(x => Trace.Info($"Found Artifact = {x.Alias} of type {x.ArtifactType}"));
-                    return filteredReleaseArtifacts;
-                }
+                IList<AgentArtifactDefinition> releaseArtifacts = releaseServer.GetReleaseArtifactsFromService(ReleaseId, TeamProjectId).ToList();
+                IList<AgentArtifactDefinition> filteredReleaseArtifacts = FilterArtifactDefintions(releaseArtifacts);
+                filteredReleaseArtifacts.ToList().ForEach(x => Trace.Info($"Found Artifact = {x.Alias} of type {x.ArtifactType}"));
+                return filteredReleaseArtifacts;
             }
             catch (Exception ex)
             {
@@ -202,70 +215,99 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
 
             executionContext.Output(StringUtil.Loc("RMDownloadingArtifact"));
 
-            foreach (AgentArtifactDefinition agentArtifactDefinition in agentArtifactDefinitions)
+            bool isTeeUsed = PlatformUtil.RunningOnLinux && agentArtifactDefinitions.Any(x =>
+                x.ArtifactType == AgentArtifactType.Tfvc);
+            if (isTeeUsed)
             {
-                // We don't need to check if its old style artifact anymore. All the build data has been fixed and all the build artifact has Alias now.
-                ArgUtil.NotNullOrEmpty(agentArtifactDefinition.Alias, nameof(agentArtifactDefinition.Alias));
-
-                var extensionManager = HostContext.GetService<IExtensionManager>();
-                IArtifactExtension extension =
-                    (extensionManager.GetExtensions<IArtifactExtension>()).FirstOrDefault(x =>
-                        agentArtifactDefinition.ArtifactType == x.ArtifactType);
-
-                if (extension == null)
-                {
-                    throw new InvalidOperationException(StringUtil.Loc("RMArtifactTypeNotSupported",
-                        agentArtifactDefinition.ArtifactType));
-                }
-
-                Trace.Info($"Found artifact extension of type {extension.ArtifactType}");
-                executionContext.Output(StringUtil.Loc("RMStartArtifactsDownload"));
-                ArtifactDefinition artifactDefinition =
-                    ConvertToArtifactDefinition(agentArtifactDefinition, executionContext, extension);
-                executionContext.Output(StringUtil.Loc("RMArtifactDownloadBegin", agentArtifactDefinition.Alias,
-                    agentArtifactDefinition.ArtifactType));
-
-                // Get the local path where this artifact should be downloaded.
-                string downloadFolderPath = Path.GetFullPath(Path.Combine(artifactsWorkingFolder,
-                    agentArtifactDefinition.Alias ?? string.Empty));
-
-                // download the artifact to this path.
-                RetryExecutor retryExecutor = new RetryExecutor();
-                retryExecutor.ShouldRetryAction = (ex) =>
-                {
-                    executionContext.Output(StringUtil.Loc("RMErrorDuringArtifactDownload", ex));
-
-                    bool retry = true;
-                    if (ex is ArtifactDownloadException)
-                    {
-                        retry = false;
-                    }
-                    else
-                    {
-                        executionContext.Output(StringUtil.Loc("RMRetryingArtifactDownload"));
-                        Trace.Warning(ex.ToString());
-                    }
-
-                    return retry;
-                };
-
-                await retryExecutor.ExecuteAsync(
-                    async () =>
-                    {
-                        var releaseFileSystemManager = HostContext.GetService<IReleaseFileSystemManager>();
-                        executionContext.Output(StringUtil.Loc("RMEnsureArtifactFolderExistsAndIsClean",
-                            downloadFolderPath));
-                        releaseFileSystemManager.EnsureEmptyDirectory(downloadFolderPath,
-                            executionContext.CancellationToken);
-
-                        await extension.DownloadAsync(executionContext, artifactDefinition, downloadFolderPath);
-                    });
-
-                executionContext.Output(StringUtil.Loc("RMArtifactDownloadFinished",
-                    agentArtifactDefinition.Alias));
+                teeUtil = new TeeUtil(
+                    executionContext.GetVariableValueOrDefault("Agent.HomeDirectory"),
+                    executionContext.GetVariableValueOrDefault("Agent.TempDirectory"),
+                    AgentKnobs.TeePluginDownloadRetryCount.GetValue(executionContext).AsInt(),
+                    executionContext.Debug,
+                    executionContext.CancellationToken
+                );
+                await teeUtil.DownloadTeeIfAbsent();
             }
 
-            executionContext.Output(StringUtil.Loc("RMArtifactsDownloadFinished"));
+            if (AgentKnobs.InstallLegacyTfExe.GetValue(executionContext).AsBoolean())
+            {
+                await TfManager.DownloadLegacyTfToolsAsync(executionContext);
+            }
+
+            try
+            {
+                foreach (AgentArtifactDefinition agentArtifactDefinition in agentArtifactDefinitions)
+                {
+                    // We don't need to check if its old style artifact anymore. All the build data has been fixed and all the build artifact has Alias now.
+                    ArgUtil.NotNullOrEmpty(agentArtifactDefinition.Alias, nameof(agentArtifactDefinition.Alias));
+
+                    var extensionManager = HostContext.GetService<IExtensionManager>();
+                    IArtifactExtension extension =
+                        (extensionManager.GetExtensions<IArtifactExtension>()).FirstOrDefault(x =>
+                            agentArtifactDefinition.ArtifactType == x.ArtifactType);
+
+                    if (extension == null)
+                    {
+                        throw new InvalidOperationException(StringUtil.Loc("RMArtifactTypeNotSupported",
+                            agentArtifactDefinition.ArtifactType));
+                    }
+
+                    Trace.Info($"Found artifact extension of type {extension.ArtifactType}");
+                    executionContext.Output(StringUtil.Loc("RMStartArtifactsDownload"));
+                    ArtifactDefinition artifactDefinition =
+                        ConvertToArtifactDefinition(agentArtifactDefinition, executionContext, extension);
+                    executionContext.Output(StringUtil.Loc("RMArtifactDownloadBegin", agentArtifactDefinition.Alias,
+                        agentArtifactDefinition.ArtifactType));
+
+                    // Get the local path where this artifact should be downloaded.
+                    string downloadFolderPath = Path.GetFullPath(Path.Combine(artifactsWorkingFolder,
+                        agentArtifactDefinition.Alias ?? string.Empty));
+
+                    // download the artifact to this path.
+                    RetryExecutor retryExecutor = new RetryExecutor();
+                    retryExecutor.ShouldRetryAction = (ex) =>
+                    {
+                        executionContext.Output(StringUtil.Loc("RMErrorDuringArtifactDownload", ex));
+
+                        bool retry = true;
+                        if (ex is ArtifactDownloadException)
+                        {
+                            retry = false;
+                        }
+                        else
+                        {
+                            executionContext.Output(StringUtil.Loc("RMRetryingArtifactDownload"));
+                            Trace.Warning(ex.ToString());
+                        }
+
+                        return retry;
+                    };
+
+                    await retryExecutor.ExecuteAsync(
+                        async () =>
+                        {
+                            var releaseFileSystemManager = HostContext.GetService<IReleaseFileSystemManager>();
+                            executionContext.Output(StringUtil.Loc("RMEnsureArtifactFolderExistsAndIsClean",
+                                downloadFolderPath));
+                            releaseFileSystemManager.EnsureEmptyDirectory(downloadFolderPath,
+                                executionContext.CancellationToken);
+
+                            await extension.DownloadAsync(executionContext, artifactDefinition, downloadFolderPath);
+                        });
+
+                    executionContext.Output(StringUtil.Loc("RMArtifactDownloadFinished",
+                        agentArtifactDefinition.Alias));
+                }
+
+                executionContext.Output(StringUtil.Loc("RMArtifactsDownloadFinished"));
+            }
+            finally
+            {
+                if (isTeeUsed && !AgentKnobs.DisableTeePluginRemoval.GetValue(executionContext).AsBoolean())
+                {
+                    teeUtil.DeleteTee();
+                }
+            }
         }
 
         private void CreateArtifactsFolder(IExecutionContext executionContext, string artifactsWorkingFolder)
@@ -446,20 +488,20 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release
             };
 
             RetryExecutor retryExecutor = new RetryExecutor();
-                retryExecutor.ShouldRetryAction = (ex) =>
+            retryExecutor.ShouldRetryAction = (ex) =>
+            {
+                bool retry = true;
+                if (ex is InvalidOperationException)
                 {
-                    bool retry = true;
-                    if (ex is InvalidOperationException)
-                    {
-                        retry = false;
-                    }
-                    else
-                    {
-                        Trace.Warning(ex.ToString());
-                    }
+                    retry = false;
+                }
+                else
+                {
+                    Trace.Warning(ex.ToString());
+                }
 
-                    return retry;
-                };
+                return retry;
+            };
 
             retryExecutor.Execute(
                 () =>

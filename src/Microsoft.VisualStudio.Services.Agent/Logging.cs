@@ -15,6 +15,7 @@ namespace Microsoft.VisualStudio.Services.Agent
 
         void Write(string message);
 
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1716: Identifiers should not match keywords")]
         void End();
     }
 
@@ -36,7 +37,9 @@ namespace Microsoft.VisualStudio.Services.Agent
         private string _dataFileName;
         private string _pagesFolder;
         private IJobServerQueue _jobServerQueue;
-
+        private const string groupStartTag = "##[group]";
+        private const string groupEndTag = "##[endgroup]";
+        private bool _groupOpened = false;
         public long TotalLines => _totalLines;
 
         public override void Initialize(IHostContext hostContext)
@@ -45,7 +48,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             base.Initialize(hostContext);
             _totalLines = 0;
             _pageId = Guid.NewGuid().ToString();
-            _pagesFolder = Path.Combine(hostContext.GetDirectory(WellKnownDirectory.Diag), PagingFolder);
+            _pagesFolder = Path.Combine(hostContext.GetDiagDirectory(), PagingFolder);
             _jobServerQueue = HostContext.GetService<IJobServerQueue>();
             Directory.CreateDirectory(_pagesFolder);
         }
@@ -69,6 +72,18 @@ namespace Microsoft.VisualStudio.Services.Agent
             {
                 Create();
             }
+
+            if (message.Contains(groupStartTag, StringComparison.OrdinalIgnoreCase))
+            {
+                _groupOpened = true;
+            } 
+            if (_groupOpened && message.Contains(groupEndTag, StringComparison.OrdinalIgnoreCase))
+            {
+                // Ignore group end tag only if group was opened, otherwise it is a normal message 
+                // because in web console ##[endgroup] becomes empty line without ##[group] tag
+                _groupOpened = false;
+                _totalLines--;
+            } 
 
             string line = $"{DateTime.UtcNow.ToString("O")} {message}";
             _pageWriter.WriteLine(line);

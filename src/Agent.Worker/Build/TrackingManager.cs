@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Globalization;
 using Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk.Knob;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 {
@@ -39,7 +40,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
         TrackingConfig MergeTrackingConfigs(
             IExecutionContext executionContext,
             TrackingConfig newConfig,
-            TrackingConfig previousConfig);
+            TrackingConfig previousConfig,
+            bool overrideBuildDirectory);
 
         void UpdateTrackingConfig(
             IExecutionContext executionContext,
@@ -122,8 +124,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
         public TrackingConfig MergeTrackingConfigs(
             IExecutionContext executionContext,
             TrackingConfig newConfig,
-            TrackingConfig previousConfig)
+            TrackingConfig previousConfig,
+            bool overrideBuildDirectory
+            )
         {
+            /*
+             * (Temporarily till we have automatic tests coverage for this case) for any changes in this method - please make sure to test following scenarios:
+             * - Self-hosted agent + several sequential pipeline runs for the same repos set - make sure that Build.SourcesDirectory is set properly after last checkout
+             */
             ArgUtil.NotNull(newConfig, nameof(newConfig));
             ArgUtil.NotNull(previousConfig, nameof(previousConfig));
 
@@ -132,9 +140,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             TrackingConfig mergedConfig = previousConfig.Clone();
 
             // Update the sources directory if we don't have one
-            if (!string.IsNullOrEmpty(mergedConfig.SourcesDirectory))
+            if (string.IsNullOrEmpty(mergedConfig.SourcesDirectory))
             {
                 mergedConfig.SourcesDirectory = newConfig.SourcesDirectory;
+            }
+
+            if (overrideBuildDirectory)
+            {
+                mergedConfig.BuildDirectory = newConfig.BuildDirectory;
             }
 
             // Fill out repository type if it's not there.
@@ -149,7 +162,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
                 mergedConfig.CollectionUrl = newConfig.CollectionUrl;
             }
 
-            return previousConfig;
+            return mergedConfig;
         }
 
         public void UpdateTrackingConfig(
@@ -179,8 +192,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             Trace.Entering();
 
             ArgUtil.NotNull(executionContext, nameof(executionContext));
-            string trackingFileLocation = GetTrackingFileLocation(executionContext);
-            return LoadIfExists(executionContext, trackingFileLocation);
+            // First, attempt to load the file from the new location (collection, definition, workspaceId)
+            string trackingFileLocation = GetTrackingFileLocation(executionContext, true);
+            var trackingConfig = LoadIfExists(executionContext, trackingFileLocation);
+            if (trackingConfig == null)
+            {
+                // If it's not in the new location, look for it in the old location
+                trackingFileLocation = GetTrackingFileLocation(executionContext, false);
+                trackingConfig = LoadIfExists(executionContext, trackingFileLocation);
+            }
+
+            return trackingConfig;
         }
 
         public void MarkForGarbageCollection(
@@ -316,7 +338,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             }
 
             IEnumerable<string> gcTrackingFiles = Directory.EnumerateFiles(gcDirectory, "*.json");
-            if (gcTrackingFiles == null || gcTrackingFiles.Count() == 0)
+            if (gcTrackingFiles == null || !gcTrackingFiles.Any())
             {
                 executionContext.Output(StringUtil.Loc("GCDirIsEmpty", gcDirectory));
                 return;
@@ -324,7 +346,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
             Trace.Info($"Find {gcTrackingFiles.Count()} GC tracking files.");
 
-            if (gcTrackingFiles.Count() > 0)
+            if (gcTrackingFiles.Any())
             {
                 foreach (string gcFile in gcTrackingFiles)
                 {
@@ -476,8 +498,20 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
                 Constants.Build.Path.TopLevelTrackingConfigFile);
         }
 
-        private string GetTrackingFileLocation(IExecutionContext executionContext)
+        private string GetTrackingFileLocation(IExecutionContext executionContext, bool includeWorkspaceId)
         {
+            string workspaceId = null;
+            if (includeWorkspaceId && executionContext.JobSettings?.TryGetValue(WellKnownJobSettings.WorkspaceIdentifier, out workspaceId) == true)
+            {
+                return Path.Combine(
+                    HostContext.GetDirectory(WellKnownDirectory.Work),
+                    Constants.Build.Path.SourceRootMappingDirectory,
+                    executionContext.Variables.System_CollectionId,
+                    executionContext.Variables.System_DefinitionId,
+                    workspaceId,
+                    Constants.Build.Path.TrackingConfigFile);
+            }
+
             return Path.Combine(
                 HostContext.GetDirectory(WellKnownDirectory.Work),
                 Constants.Build.Path.SourceRootMappingDirectory,
@@ -506,7 +540,23 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
             // Update the info properties and save the file.
             config.UpdateJobRunProperties(executionContext);
-            WriteToFile(GetTrackingFileLocation(executionContext), config);
+
+            // Make sure we clean up any files in the old location (no workspace id in the path)
+            string oldLocation = GetTrackingFileLocation(executionContext, false);
+            if (File.Exists(oldLocation))
+            {
+                try
+                {
+                    IOUtil.DeleteFileWithRetry(oldLocation, executionContext.CancellationToken).Wait();
+                }
+                catch (Exception ex)
+                {
+                    Trace.Warning($"Unable to delete old tracking folder, ex:{ex.GetType()}");
+                    throw;
+                }
+            }
+
+            WriteToFile(GetTrackingFileLocation(executionContext, true), config);
         }
 
         private void PrintOutDiskUsage(IExecutionContext context)

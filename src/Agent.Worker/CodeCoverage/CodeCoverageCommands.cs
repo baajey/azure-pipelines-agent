@@ -7,13 +7,15 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Agent.Sdk.Util;
 using Microsoft.VisualStudio.Services.WebApi;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
 {
-    public sealed class CodeCoverageCommandExtension: BaseWorkerCommandExtension
+    public sealed class CodeCoverageCommandExtension : BaseWorkerCommandExtension
     {
 
         public CodeCoverageCommandExtension()
@@ -25,7 +27,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
     }
 
     #region publish code coverage helper methods
-    public sealed class PublishCodeCoverageCommand: IWorkerCommand
+    public sealed class PublishCodeCoverageCommand : IWorkerCommand
     {
         public string Name => "publish";
         public List<string> Aliases => null;
@@ -67,7 +69,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
             context.Output(StringUtil.Loc("ReadingCodeCoverageSummary", _summaryFileLocation));
             var coverageData = reader.GetCodeCoverageSummary(context, _summaryFileLocation);
 
-            if (coverageData == null || coverageData.Count() == 0)
+            if (coverageData == null || !coverageData.Any())
             {
                 context.Warning(StringUtil.Loc("CodeCoverageDataIsNull"));
             }
@@ -93,7 +95,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
             CancellationToken cancellationToken)
         {
             //step 2: publish code coverage summary to TFS
-            if (coverageData != null && coverageData.Count() > 0)
+            if (coverageData != null && coverageData.Any())
             {
                 commandContext.Output(StringUtil.Loc("PublishingCodeCoverage"));
                 foreach (var coverage in coverageData)
@@ -144,6 +146,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
                 ChangeHtmExtensionToHtmlIfRequired(newReportDirectory, executionContext);
 
                 await codeCoveragePublisher.PublishCodeCoverageFilesAsync(commandContext, projectId, executionContext.Variables.System_JobId, containerId, filesToPublish, File.Exists(Path.Combine(newReportDirectory, CodeCoverageConstants.DefaultIndexFile)), cancellationToken);
+            }
+            catch (SocketException ex)
+            {
+                using var vssConnection = WorkerUtilities.GetVssConnection(executionContext);
+                ExceptionsUtil.HandleSocketException(ex, vssConnection.Uri.ToString(), executionContext.Warning);
             }
             catch (Exception ex)
             {
@@ -275,7 +282,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.CodeCoverage
                     File.Exists(nonFrameHtml))
                 {
                     // duplicating frame-summary.html to index.html and renaming index.html to newindex.html
-                    File.Delete(newIndexHtml);
+                    try
+                    {
+                        IOUtil.DeleteFileWithRetry(newIndexHtml, executionContext.CancellationToken).Wait();
+                    }
+                    catch (Exception ex)
+                    {
+                        executionContext.GetTraceWriter()?.Info($"Unable to delete old tracking folder, ex:{ex.GetType()}");
+                        throw;
+                    }
                     File.Move(indexHtml, newIndexHtml);
                     File.Copy(nonFrameHtml, indexHtml, overwrite: true);
                 }

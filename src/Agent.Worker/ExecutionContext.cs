@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
@@ -15,6 +16,8 @@ using Microsoft.VisualStudio.Services.WebApi;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.VisualStudio.Services.Agent.Worker.Telemetry;
+using Newtonsoft.Json;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -36,7 +39,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         List<ServiceEndpoint> Endpoints { get; }
         List<SecureFile> SecureFiles { get; }
         List<Pipelines.RepositoryResource> Repositories { get; }
-        Dictionary<string,string> JobSettings { get; }
+        Dictionary<string, string> JobSettings { get; }
 
         PlanFeatures Features { get; }
         Variables Variables { get; }
@@ -46,21 +49,23 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         List<string> PrependPath { get; }
         List<ContainerInfo> Containers { get; }
         List<ContainerInfo> SidecarContainers { get; }
+        List<TaskRestrictions> Restrictions { get; }
 
         // Initialize
         void InitializeJob(Pipelines.AgentJobRequestMessage message, CancellationToken token);
         void CancelToken();
-        IExecutionContext CreateChild(Guid recordId, string displayName, string refName, Variables taskVariables = null, bool outputForward = false);
+        IExecutionContext CreateChild(Guid recordId, string displayName, string refName, Variables taskVariables = null, bool outputForward = false, List<TaskRestrictions> taskRestrictions = null);
 
         // logging
         bool WriteDebug { get; }
-        long Write(string tag, string message);
+        long Write(string tag, string message, bool canMaskSecrets = true);
         void QueueAttachFile(string type, string name, string filePath);
+        ITraceWriter GetTraceWriter();
 
         // timeline record update methods
         void Start(string currentOperation = null);
         TaskResult Complete(TaskResult? result = null, string currentOperation = null, string resultCode = null);
-        void SetVariable(string name, string value, bool isSecret = false, bool isOutput = false, bool isFilePath = false, bool isReadOnly = false);
+        void SetVariable(string name, string value, bool isSecret = false, bool isOutput = false, bool isFilePath = false, bool isReadOnly = false, bool preserveCase = false);
         void SetTimeout(TimeSpan? timeout);
         void AddIssue(Issue issue);
         void Progress(int percentage, string currentOperation = null);
@@ -73,6 +78,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         void SetStepTarget(Pipelines.StepTarget target);
         string TranslatePathForStepTarget(string val);
         IHostContext GetHostContext();
+        /// <summary>
+        /// Re-initializes force completed - between next retry attempt
+        /// </summary>
+        /// <returns></returns>
+        void ReInitializeForceCompleted();
+        /// <summary>
+        /// Cancel force task completion between retry attempts
+        /// </summary>
+        /// <returns></returns>
+        void CancelForceTaskCompletion();
+        void EmitHostNode20FallbackTelemetry(bool node20ResultsInGlibCErrorHost);
+        void PublishTaskRunnerTelemetry(Dictionary<string, string> taskRunnerData);
     }
 
     public sealed class ExecutionContext : AgentService, IExecutionContext, IDisposable
@@ -84,6 +101,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private readonly object _loggerLock = new object();
         private readonly List<IAsyncCommandContext> _asyncCommands = new List<IAsyncCommandContext>();
         private readonly HashSet<string> _outputvariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<TaskRestrictions> _restrictions = new List<TaskRestrictions>();
+        private readonly string _buildLogsFolderName = "buildlogs";
         private IAgentLogPlugin _logPlugin;
         private IPagingLogger _logger;
         private IJobServerQueue _jobServerQueue;
@@ -93,10 +112,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private Guid _detailTimelineId;
         private int _childTimelineRecordOrder = 0;
         private CancellationTokenSource _cancellationTokenSource;
+        private CancellationTokenSource _forceCompleteCancellationTokenSource = new CancellationTokenSource();
         private TaskCompletionSource<int> _forceCompleted = new TaskCompletionSource<int>();
         private bool _throttlingReported = false;
         private ExecutionTargetInfo _defaultStepTarget;
         private ExecutionTargetInfo _currentStepTarget;
+        private LogsStreamingOptions _logsStreamingOptions;
+        private string _buildLogsFolderPath;
+        private string _buildLogsFile;
+        private FileStream _buildLogsData;
+        private StreamWriter _buildLogsWriter;
+        private bool emittedHostNode20FallbackTelemetry = false;
 
         // only job level ExecutionContext will track throttling delay.
         private long _totalThrottlingDelayInMilliseconds = 0;
@@ -104,6 +130,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public Guid Id => _record.Id;
         public Task ForceCompleted => _forceCompleted.Task;
         public CancellationToken CancellationToken => _cancellationTokenSource.Token;
+        public CancellationToken ForceCompleteCancellationToken => _forceCompleteCancellationTokenSource.Token;
         public List<ServiceEndpoint> Endpoints { get; private set; }
         public List<SecureFile> SecureFiles { get; private set; }
         public List<Pipelines.RepositoryResource> Repositories { get; private set; }
@@ -115,6 +142,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public List<string> PrependPath { get; private set; }
         public List<ContainerInfo> Containers { get; private set; }
         public List<ContainerInfo> SidecarContainers { get; private set; }
+        public List<TaskRestrictions> Restrictions => _restrictions;
         public List<IAsyncCommandContext> AsyncCommands => _asyncCommands;
 
         public TaskResult? Result
@@ -151,6 +179,26 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             base.Initialize(hostContext);
 
+            var agentSettings = HostContext.GetService<IConfigurationStore>().GetSettings();
+
+
+            _logsStreamingOptions = LogsStreamingOptions.StreamToServer;
+            if (agentSettings.ReStreamLogsToFiles)
+            {
+                _logsStreamingOptions |= LogsStreamingOptions.StreamToFiles;
+            }
+            else if (agentSettings.DisableLogUploads)
+            {
+                _logsStreamingOptions = LogsStreamingOptions.StreamToFiles;
+            }
+            Trace.Info($"Logs streaming mode: {_logsStreamingOptions}");
+
+            if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToFiles))
+            {
+                _buildLogsFolderPath = Path.Combine(hostContext.GetDiagDirectory(), _buildLogsFolderName);
+                Directory.CreateDirectory(_buildLogsFolderPath);
+            }
+
             _jobServerQueue = HostContext.GetService<IJobServerQueue>();
         }
 
@@ -164,17 +212,27 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             Trace.Info("Force finish current task in 5 sec.");
             Task.Run(async () =>
             {
-                await Task.Delay(TimeSpan.FromSeconds(5));
-                _forceCompleted?.TrySetResult(1);
+                await Task.Delay(TimeSpan.FromSeconds(5), ForceCompleteCancellationToken);
+                if (!ForceCompleteCancellationToken.IsCancellationRequested)
+                {
+                    _forceCompleted?.TrySetResult(1);
+                }
             });
         }
 
+        public void CancelForceTaskCompletion()
+        {
+            Trace.Info($"Forced completion canceled");
+            this._forceCompleteCancellationTokenSource.Cancel();
+        }
+
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1721: Property names should not match get methods")]
         public IHostContext GetHostContext()
         {
             return HostContext;
         }
 
-        public IExecutionContext CreateChild(Guid recordId, string displayName, string refName, Variables taskVariables = null, bool outputForward = false)
+        public IExecutionContext CreateChild(Guid recordId, string displayName, string refName, Variables taskVariables = null, bool outputForward = false, List<TaskRestrictions> taskRestrictions = null)
         {
             Trace.Entering();
 
@@ -197,6 +255,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             child._defaultStepTarget = _defaultStepTarget;
             child._currentStepTarget = _currentStepTarget;
 
+            if (taskRestrictions != null)
+            {
+                child.Restrictions.AddRange(taskRestrictions);
+            }
+
             child.InitializeTimelineRecord(_mainTimelineId, recordId, _record.Id, ExecutionContextType.Task, displayName, refName, ++_childTimelineRecordOrder);
 
             child._logger = HostContext.CreateService<IPagingLogger>();
@@ -212,6 +275,28 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             _record.State = TimelineRecordState.InProgress;
 
             _jobServerQueue.QueueTimelineRecordUpdate(_mainTimelineId, _record);
+
+            if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToFiles))
+            {
+                var buildLogsJobFolder = Path.Combine(_buildLogsFolderPath, _mainTimelineId.ToString());
+                Directory.CreateDirectory(buildLogsJobFolder);
+                string pattern = new string(Path.GetInvalidFileNameChars()) + new string(Path.GetInvalidPathChars());
+                Regex regex = new Regex(string.Format("[{0}]", Regex.Escape(pattern)));
+                var recordName = regex.Replace(_record.Name, string.Empty);
+
+                _buildLogsFile = Path.Combine(buildLogsJobFolder, $"{recordName}-{_record.Id.ToString()}.log");
+                _buildLogsData = new FileStream(_buildLogsFile, FileMode.CreateNew);
+                _buildLogsWriter = new StreamWriter(_buildLogsData, System.Text.Encoding.UTF8);
+
+                if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToServerAndFiles))
+                {
+                    _logger.Write(StringUtil.Loc("LogOutputMessage", _buildLogsFile));
+                }
+                else
+                {
+                    _logger.Write(StringUtil.Loc("BuildLogsMessage", _buildLogsFile));
+                }
+            }
         }
 
         public TaskResult Complete(TaskResult? result = null, string currentOperation = null, string resultCode = null)
@@ -221,10 +306,27 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 Result = result;
             }
 
+            if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToFiles))
+            {
+                _buildLogsWriter.Flush();
+                _buildLogsData.Flush();
+                //The StreamWriter object calls Dispose() on the provided Stream object when StreamWriter.Dispose is called.
+                _buildLogsWriter.Dispose();
+                _buildLogsWriter = null;
+                _buildLogsData.Dispose();
+                _buildLogsData = null;
+            }
+
             // report total delay caused by server throttling.
             if (_totalThrottlingDelayInMilliseconds > 0)
             {
                 this.Warning(StringUtil.Loc("TotalThrottlingDelay", TimeSpan.FromMilliseconds(_totalThrottlingDelayInMilliseconds).TotalSeconds));
+            }
+
+            if (!AgentKnobs.DisableDrainQueuesAfterTask.GetValue(this).AsBoolean())
+            {
+                _jobServerQueue.ForceDrainWebConsoleQueue = true;
+                _jobServerQueue.ForceDrainTimelineQueue = true;
             }
 
             _record.CurrentOperation = currentOperation ?? _record.CurrentOperation;
@@ -257,7 +359,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             return Result.Value;
         }
 
-        public void SetVariable(string name, string value, bool isSecret = false, bool isOutput = false, bool isFilePath = false, bool isReadOnly = false)
+        public void SetVariable(string name, string value, bool isSecret = false, bool isOutput = false, bool isFilePath = false, bool isReadOnly = false, bool preserveCase = false)
         {
             ArgUtil.NotNullOrEmpty(name, nameof(name));
 
@@ -271,11 +373,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 _jobServerQueue.QueueTimelineRecordUpdate(_mainTimelineId, _record);
 
                 ArgUtil.NotNullOrEmpty(_record.RefName, nameof(_record.RefName));
-                Variables.Set($"{_record.RefName}.{name}", value, secret: isSecret, readOnly: (isOutput || isReadOnly));
+                Variables.Set($"{_record.RefName}.{name}", value, secret: isSecret, readOnly: (isOutput || isReadOnly), preserveCase: preserveCase);
             }
             else
             {
-                Variables.Set(name, value, secret: isSecret, readOnly: isReadOnly);
+                Variables.Set(name, value, secret: isSecret, readOnly: isReadOnly, preserveCase: preserveCase);
             }
         }
 
@@ -413,6 +515,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             var checkouts = message.Steps?.Where(x => Pipelines.PipelineConstants.IsCheckoutTask(x)).ToList();
             JobSettings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             JobSettings[WellKnownJobSettings.HasMultipleCheckouts] = Boolean.FalseString;
+            JobSettings[WellKnownJobSettings.CommandCorrelationId] = Guid.NewGuid().ToString();
             if (checkouts != null && checkouts.Count > 0)
             {
                 JobSettings[WellKnownJobSettings.HasMultipleCheckouts] = checkouts.Count > 1 ? Boolean.TrueString : Boolean.FalseString;
@@ -426,6 +529,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         repo.Properties.Set<bool>(RepositoryUtil.IsPrimaryRepository, true);
                     }
                 }
+
+                var defaultWorkingDirectoryCheckout = Build.BuildJobExtension.GetDefaultWorkingDirectoryCheckoutTask(message.Steps);
+                if (Repositories != null && defaultWorkingDirectoryCheckout != null && defaultWorkingDirectoryCheckout.Inputs.TryGetValue(Pipelines.PipelineConstants.CheckoutTaskInputs.Repository, out string defaultWorkingDirectoryRepoAlias))
+                {
+                    var defaultWorkingDirectoryRepo = Repositories.Find(r => String.Equals(r.Alias, defaultWorkingDirectoryRepoAlias, StringComparison.OrdinalIgnoreCase));
+                    if (defaultWorkingDirectoryRepo != null)
+                    {
+                        defaultWorkingDirectoryRepo.Properties.Set<bool>(RepositoryUtil.IsDefaultWorkingDirectoryRepository, true);
+                        JobSettings[WellKnownJobSettings.DefaultWorkingDirectoryRepository] = defaultWorkingDirectoryRepoAlias;
+
+                        Trace.Info($"Will set the path of the following repository to be the System.DefaultWorkingDirectory: {defaultWorkingDirectoryRepoAlias}");
+                    }
+                }
             }
 
             // Variables (constructor performs initial recursive expansion)
@@ -433,8 +549,32 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             Variables = new Variables(HostContext, message.Variables, out warnings);
             Variables.StringTranslator = TranslatePathForStepTarget;
 
+            if (Variables.GetBoolean("agent.useWorkspaceId") == true)
+            {
+                try
+                {
+                    // We need an identifier that represents which repos make up the workspace.
+                    // This allows similar jobs in the same definition to reuse that workspace and other jobs to have their own.
+                    JobSettings[WellKnownJobSettings.WorkspaceIdentifier] = GetWorkspaceIdentifier(message);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Warning($"Unable to generate workspace ID: {ex.Message}");
+                }
+            }
+
             // Prepend Path
             PrependPath = new List<string>();
+
+            var minSecretLen = AgentKnobs.MaskedSecretMinLength.GetValue(this).AsInt();
+            HostContext.SecretMasker.MinSecretLength = minSecretLen;
+
+            if (HostContext.SecretMasker.MinSecretLength < minSecretLen)
+            {
+                warnings.Add(StringUtil.Loc("MinSecretsLengtLimitWarning", HostContext.SecretMasker.MinSecretLength));
+            }
+
+            HostContext.SecretMasker.RemoveShortSecretsFromDictionary();
 
             // Docker (JobContainer)
             string imageName = Variables.Get("_PREVIEW_VSTS_DOCKER_IMAGE");
@@ -573,27 +713,52 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             _jobServerQueue.JobServerQueueThrottling += JobServerQueueThrottling_EventReceived;
         }
 
+        private string GetWorkspaceIdentifier(Pipelines.AgentJobRequestMessage message)
+        {
+            Variables.TryGetValue(Constants.Variables.System.CollectionId, out string collectionId);
+            Variables.TryGetValue(Constants.Variables.System.DefinitionId, out string definitionId);
+            var repoTrackingInfos = message.Resources.Repositories.Select(repo => new Build.RepositoryTrackingInfo(repo, "/")).ToList();
+            var workspaceIdentifier = Build.TrackingConfigHashAlgorithm.ComputeHash(collectionId, definitionId, repoTrackingInfos);
+
+            Trace.Info($"WorkspaceIdentifier '{workspaceIdentifier}' created for repos {String.Join(',', repoTrackingInfos)}");
+            return workspaceIdentifier;
+        }
+
         // Do not add a format string overload. In general, execution context messages are user facing and
         // therefore should be localized. Use the Loc methods from the StringUtil class. The exception to
         // the rule is command messages - which should be crafted using strongly typed wrapper methods.
-        public long Write(string tag, string message)
+        public long Write(string tag, string inputMessage, bool canMaskSecrets = true)
         {
-            string msg = HostContext.SecretMasker.MaskSecrets($"{tag}{message}");
+            string message = canMaskSecrets ? HostContext.SecretMasker.MaskSecrets($"{tag}{inputMessage}") : inputMessage;
+
             long totalLines;
             lock (_loggerLock)
             {
                 totalLines = _logger.TotalLines + 1;
-                _logger.Write(msg);
+
+                if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToServer))
+                {
+                    _logger.Write(message);
+                }
+                if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToFiles))
+                {
+                    //Add date time stamp to log line
+                    _buildLogsWriter.WriteLine("{0:O} {1}", DateTime.UtcNow, message);
+                }
             }
 
-            // write to job level execution context's log file.
-            var parentContext = _parentExecutionContext as ExecutionContext;
-            if (parentContext != null)
+            if (_logsStreamingOptions.HasFlag(LogsStreamingOptions.StreamToServer))
             {
-                lock (parentContext._loggerLock)
+                // write to job level execution context's log file.
+                if (_parentExecutionContext is ExecutionContext parentContext)
                 {
-                    parentContext._logger.Write(msg);
+                    lock (parentContext._loggerLock)
+                    {
+                        parentContext._logger.Write(message);
+                    }
                 }
+
+                _jobServerQueue.QueueWebConsoleLine(_record.Id, message, totalLines);
             }
 
             // write to plugin daemon,
@@ -604,10 +769,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     _logPlugin = HostContext.GetService<IAgentLogPlugin>();
                 }
 
-                _logPlugin.Write(_record.Id, msg);
+                _logPlugin.Write(_record.Id, message);
             }
 
-            _jobServerQueue.QueueWebConsoleLine(_record.Id, msg, totalLines);
             return totalLines;
         }
 
@@ -623,6 +787,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             }
 
             _jobServerQueue.QueueFileUpload(_mainTimelineId, _record.Id, type, name, filePath, deleteSource: false);
+        }
+
+        public ITraceWriter GetTraceWriter()
+        {
+            return Trace;
         }
 
         private void InitializeTimelineRecord(Guid timelineId, Guid timelineRecordId, Guid? parentTimelineRecordId, string recordType, string displayName, string refName, int? order)
@@ -645,6 +814,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
             var configuration = HostContext.GetService<IConfigurationStore>();
             _record.WorkerName = configuration.GetSettings().AgentName;
+            _record.Variables.Add(TaskWellKnownItems.AgentVersionTimelineVariable, BuildConstants.AgentPackage.Version);
 
             _jobServerQueue.QueueTimelineRecordUpdate(_mainTimelineId, _record);
         }
@@ -706,11 +876,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public string TranslatePathForStepTarget(string val)
         {
             var stepTarget = StepTarget();
-            if (stepTarget != null)
+            var isCheckoutType = Convert.ToBoolean(this.Variables.Get(Constants.Variables.Task.SkipTranslatorForCheckout, true));
+            if (stepTarget == null || (isCheckoutType && (_currentStepTarget == null || stepTarget is HostInfo)))
             {
-                return stepTarget.TranslateContainerPathForImageOS(PlatformUtil.HostOS, stepTarget.TranslateToContainerPath(val));
+                return val;
             }
-            return val;
+            return stepTarget.TranslateContainerPathForImageOS(PlatformUtil.HostOS, stepTarget.TranslateToContainerPath(val));
         }
 
         public ExecutionTargetInfo StepTarget()
@@ -725,17 +896,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         public void SetStepTarget(Pipelines.StepTarget target)
         {
-            // Enforce command restriction if set for the step target
-            var commandManager = HostContext.GetService<IWorkerCommandManager>();
-            if (string.Equals(WellKnownStepTargetStrings.Restricted, target?.Commands, StringComparison.OrdinalIgnoreCase))
-            {
-                commandManager.SetCommandRestrictionPolicy(new AttributeBasedWorkerCommandRestrictionPolicy());
-            }
-            else
-            {
-                commandManager.SetCommandRestrictionPolicy(new UnrestricedWorkerCommandRestrictionPolicy());
-            }
-
             // When step targets are set, we need to take over control for translating paths
             // from the job execution context
             Variables.StringTranslator = TranslatePathForStepTarget;
@@ -762,9 +922,77 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             return new SystemEnvironment();
         }
 
+        public void ReInitializeForceCompleted()
+        {
+            this._forceCompleted = new TaskCompletionSource<int>();
+            this._forceCompleteCancellationTokenSource = new CancellationTokenSource();
+        }
+
+        public void EmitHostNode20FallbackTelemetry(bool node20ResultsInGlibCErrorHost)
+        {
+            if (!emittedHostNode20FallbackTelemetry)
+            {
+                PublishTelemetry(new Dictionary<string, string>
+                        {
+                            {  "HostNode20to16Fallback", node20ResultsInGlibCErrorHost.ToString() }
+                        });
+
+                emittedHostNode20FallbackTelemetry = true;
+            }
+        }
+
+        // This overload is to handle specific types some other way.
+        private void PublishTelemetry<T>(
+            Dictionary<string, T> telemetryData,
+            string feature = "TaskHandler",
+            bool IsAgentTelemetry = false
+        )
+        {
+            // JsonConvert.SerializeObject always converts to base object.
+            PublishTelemetry((object)telemetryData, feature, IsAgentTelemetry);
+        }
+
+        private void PublishTelemetry(
+            object telemetryData,
+            string feature = "TaskHandler",
+            bool IsAgentTelemetry = false
+        )
+        {
+            var cmd = new Command("telemetry", "publish")
+            {
+                Data = JsonConvert.SerializeObject(telemetryData, Formatting.None)
+            };
+            cmd.Properties.Add("area", "PipelinesTasks");
+            cmd.Properties.Add("feature", feature);
+
+            var publishTelemetryCmd = new TelemetryCommandExtension(IsAgentTelemetry);
+            publishTelemetryCmd.Initialize(HostContext);
+            publishTelemetryCmd.ProcessCommand(this, cmd);
+        }
+
+        public void PublishTaskRunnerTelemetry(Dictionary<string, string> taskRunnerData)
+        {
+            PublishTelemetry(taskRunnerData, IsAgentTelemetry: true);
+        }
+
         public void Dispose()
         {
             _cancellationTokenSource?.Dispose();
+            _forceCompleteCancellationTokenSource?.Dispose();
+
+            _buildLogsWriter?.Dispose();
+            _buildLogsWriter = null;
+            _buildLogsData?.Dispose();
+            _buildLogsData = null;
+        }
+
+        [Flags]
+        private enum LogsStreamingOptions
+        {
+            None = 0,
+            StreamToServer = 1,
+            StreamToFiles = 2,
+            StreamToServerAndFiles = StreamToServer | StreamToFiles
         }
     }
 
@@ -777,7 +1005,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             ArgUtil.NotNull(context, nameof(context));
             ArgUtil.NotNull(ex, nameof(ex));
 
-            context.Error(ex.Message);
+            context.Error(ex.Message, new Dictionary<string, string> { { TaskWellKnownItems.IssueSourceProperty, Constants.TaskInternalIssueSource } });
             context.Debug(ex.ToString());
         }
 
@@ -788,6 +1016,21 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             context.AddIssue(new Issue() { Type = IssueType.Error, Message = message });
         }
 
+        public static void Error(this IExecutionContext context, string message, Dictionary<string, string> properties)
+        {
+            ArgUtil.NotNull(context, nameof(context));
+            ArgUtil.NotNull(properties, nameof(properties));
+
+            var issue = new Issue() { Type = IssueType.Error, Message = message };
+
+            foreach (var property in properties.Keys)
+            {
+                issue.Data[property] = properties[property];
+            }
+
+            context.AddIssue(issue);
+        }
+
         // Do not add a format string overload. See comment on ExecutionContext.Write().
         public static void Warning(this IExecutionContext context, string message)
         {
@@ -796,10 +1039,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         }
 
         // Do not add a format string overload. See comment on ExecutionContext.Write().
-        public static void Output(this IExecutionContext context, string message)
+        public static void Output(this IExecutionContext context, string message, bool canMaskSecrets = true)
         {
             ArgUtil.NotNull(context, nameof(context));
-            context.Write(null, message);
+            context.Write(null, message, canMaskSecrets);
         }
 
         // Do not add a format string overload. See comment on ExecutionContext.Write().

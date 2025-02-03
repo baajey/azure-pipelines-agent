@@ -1,7 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
@@ -27,15 +25,15 @@ namespace Test.L0.Worker
                 var command = new Microsoft.VisualStudio.Services.Agent.Command("area", "event");
 
                 // missing alias
-                Assert.Throws<Exception>(() => updateRepoPath.Execute(_ec.Object, command));
+                Assert.Throws<ArgumentNullException>(() => updateRepoPath.Execute(_ec.Object, command));
 
                 // add alias, still missing matching repository                
                 command.Properties.Add("alias", "repo1");
-                Assert.Throws<Exception>(() => updateRepoPath.Execute(_ec.Object, command));
+                Assert.Throws<ArgumentNullException>(() => updateRepoPath.Execute(_ec.Object, command));
 
                 // add repository, still missing data
                 _repositories.Add(new RepositoryResource() { Alias = "repo1" });
-                Assert.Throws<Exception>(() => updateRepoPath.Execute(_ec.Object, command));
+                Assert.Throws<ArgumentNullException>(() => updateRepoPath.Execute(_ec.Object, command));
             }
         }
 
@@ -171,8 +169,8 @@ namespace Test.L0.Worker
             _ec.Setup(x => x.Variables).Returns(_variables);
             _ec.Setup(x => x.Repositories).Returns(_repositories);
             _ec.Setup(x => x.GetHostContext()).Returns(hc);
-            _ec.Setup(x => x.SetVariable(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
-                .Callback<string, string, bool, bool, bool, bool>((name, value, secret, b2, b3, readOnly) => _variables.Set(name, value, secret, readOnly));
+            _ec.Setup(x => x.SetVariable(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
+                .Callback<string, string, bool, bool, bool, bool, bool>((name, value, secret, b2, b3, readOnly, preserveCase) => _variables.Set(name, value, secret, readOnly, preserveCase));
 
             if (isMultiCheckout)
             {
@@ -182,15 +180,15 @@ namespace Test.L0.Worker
             }
 
             var directoryManager = new Mock<Microsoft.VisualStudio.Services.Agent.Worker.Build.IBuildDirectoryManager>();
-            directoryManager.Setup(x => x.GetRelativeRepositoryPath(It.IsAny<string>(), It.IsAny<string>()))
-                .Returns<string, string>((bd, path) => GetLastPathPart(path));
-            
+            directoryManager.Setup(x => x.GetRelativeRepositoryPath(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<IExecutionContext>()))
+                .Returns<string, string, IExecutionContext>((bd, path, context) => GetLastPathPart(path));
+
             hc.SetSingleton(directoryManager.Object);
         }
 
         private string GetLastPathPart(string path)
         {
-            return path?.Substring(path.LastIndexOfAny(new char[] { '/', '\\' } ) + 1);
+            return path?.Substring(path.LastIndexOfAny(new char[] { '/', '\\' }) + 1);
         }
 
         private RepositoryResource _selfRepo;

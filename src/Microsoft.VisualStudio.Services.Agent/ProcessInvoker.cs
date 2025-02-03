@@ -16,6 +16,9 @@ namespace Microsoft.VisualStudio.Services.Agent
     {
         event EventHandler<ProcessDataReceivedEventArgs> OutputDataReceived;
         event EventHandler<ProcessDataReceivedEventArgs> ErrorDataReceived;
+        TimeSpan SigintTimeout { get; set; }
+        TimeSpan SigtermTimeout { get; set; }
+        bool TryUseGracefulShutdown { get; set; }
 
         Task<int> ExecuteAsync(
             string workingDirectory,
@@ -72,6 +75,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             bool killProcessOnCancel,
             InputQueue<string> redirectStandardIn,
             bool inheritConsoleHandler,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken);
 
         Task<int> ExecuteAsync(
@@ -85,6 +89,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             InputQueue<string> redirectStandardIn,
             bool inheritConsoleHandler,
             bool keepStandardInOpen,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken);
 
         Task<int> ExecuteAsync(
@@ -99,6 +104,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             bool inheritConsoleHandler,
             bool keepStandardInOpen,
             bool highPriorityProcess,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken);
     }
 
@@ -112,7 +118,25 @@ namespace Microsoft.VisualStudio.Services.Agent
     public sealed class ProcessInvokerWrapper : AgentService, IProcessInvoker
     {
         private ProcessInvoker _invoker;
-        public bool DisableWorkerCommands {get; set; }
+        public bool DisableWorkerCommands { get; set; }
+
+        public TimeSpan SigintTimeout
+        {
+            get => _invoker.SigintTimeout;
+            set => _invoker.SigintTimeout = value;
+        }
+
+        public TimeSpan SigtermTimeout
+        {
+            get => _invoker.SigtermTimeout;
+            set => _invoker.SigtermTimeout = value;
+        }
+
+        public bool TryUseGracefulShutdown
+        {
+            get => _invoker.TryUseGracefulShutdown;
+            set => _invoker.TryUseGracefulShutdown = value;
+        }
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -220,6 +244,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 killProcessOnCancel: killProcessOnCancel,
                 redirectStandardIn: redirectStandardIn,
                 inheritConsoleHandler: false,
+                continueAfterCancelProcessTreeKillAttempt: ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault,
                 cancellationToken: cancellationToken
             );
         }
@@ -234,6 +259,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             bool killProcessOnCancel,
             InputQueue<string> redirectStandardIn,
             bool inheritConsoleHandler,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken)
         {
             return ExecuteAsync(
@@ -247,6 +273,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 redirectStandardIn: redirectStandardIn,
                 inheritConsoleHandler: inheritConsoleHandler,
                 keepStandardInOpen: false,
+                continueAfterCancelProcessTreeKillAttempt: continueAfterCancelProcessTreeKillAttempt,
                 cancellationToken: cancellationToken
             );
         }
@@ -262,6 +289,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             InputQueue<string> redirectStandardIn,
             bool inheritConsoleHandler,
             bool keepStandardInOpen,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken)
         {
             return ExecuteAsync(
@@ -276,6 +304,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 inheritConsoleHandler: inheritConsoleHandler,
                 keepStandardInOpen: keepStandardInOpen,
                 highPriorityProcess: false,
+                continueAfterCancelProcessTreeKillAttempt: continueAfterCancelProcessTreeKillAttempt,
                 cancellationToken: cancellationToken
             );
         }
@@ -292,23 +321,25 @@ namespace Microsoft.VisualStudio.Services.Agent
             bool inheritConsoleHandler,
             bool keepStandardInOpen,
             bool highPriorityProcess,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken)
         {
             _invoker.ErrorDataReceived += this.ErrorDataReceived;
             _invoker.OutputDataReceived += this.OutputDataReceived;
             return await _invoker.ExecuteAsync(
-                workingDirectory,
-                fileName,
-                arguments,
-                environment,
-                requireExitCodeZero,
-                outputEncoding,
-                killProcessOnCancel,
-                redirectStandardIn,
-                inheritConsoleHandler,
-                keepStandardInOpen,
-                highPriorityProcess,
-                cancellationToken);
+                workingDirectory: workingDirectory,
+                fileName: fileName,
+                arguments: arguments,
+                environment: environment,
+                requireExitCodeZero: requireExitCodeZero,
+                outputEncoding: outputEncoding,
+                killProcessOnCancel: killProcessOnCancel,
+                redirectStandardIn: redirectStandardIn,
+                inheritConsoleHandler: inheritConsoleHandler,
+                keepStandardInOpen: keepStandardInOpen,
+                highPriorityProcess: highPriorityProcess,
+                continueAfterCancelProcessTreeKillAttempt: continueAfterCancelProcessTreeKillAttempt,
+                cancellationToken: cancellationToken);
         }
 
         public void Dispose()

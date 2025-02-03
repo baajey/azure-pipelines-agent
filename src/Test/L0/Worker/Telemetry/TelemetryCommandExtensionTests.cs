@@ -21,7 +21,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
         private List<string> _errors = new List<string>();
         private Mock<ICustomerIntelligenceServer> _mockCiService;
         private Mock<IAsyncCommandContext> _mockCommandContext;
-        private IWorkerCommandRestrictionPolicy _policy = new UnrestricedWorkerCommandRestrictionPolicy();
 
         [Fact]
         [Trait("Level", "L0")]
@@ -46,7 +45,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Properties.Add("area", "Test");
                 cmd.Properties.Add("feature", "Task");
 
-                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy);
+                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd);
                 _mockCiService.Verify(s => s.PublishEventsAsync(It.Is<CustomerIntelligenceEvent[]>(e => VerifyEvent(e, data))), Times.Once());
             }
         }
@@ -72,7 +71,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Properties.Add("area", "Test");
                 cmd.Properties.Add("feature", "Task");
 
-                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy);
+                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd);
                 _mockCiService.Verify(s => s.PublishEventsAsync(It.Is<CustomerIntelligenceEvent[]>(e => VerifyEvent(e, data))), Times.Once());
             }
         }
@@ -91,7 +90,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Data = "key1=value1;key2=value2";
                 cmd.Properties.Add("feature", "Task");
 
-                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy));
+                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd));
             }
         }
 
@@ -109,7 +108,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Data = "key1=value1;key2=value2";
                 cmd.Properties.Add("area", "Test");
 
-                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy));
+                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd));
             }
         }
 
@@ -127,7 +126,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Properties.Add("area", "Test");
                 cmd.Properties.Add("feature", "Task");
 
-                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy));
+                Assert.Throws<ArgumentException>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd));
             }
         }
 
@@ -145,7 +144,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Properties.Add("area", "Test");
                 cmd.Properties.Add("feature", "Task");
 
-                var ex = Assert.Throws<Exception>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy));
+                var ex = Assert.Throws<Exception>(() => publishTelemetryCmd.ProcessCommand(_ec.Object, cmd));
             }
         }
 
@@ -174,15 +173,79 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
                 cmd.Properties.Add("area", "Test");
                 cmd.Properties.Add("feature", "Task");
 
-                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd, _policy);
+                publishTelemetryCmd.ProcessCommand(_ec.Object, cmd);
                 _mockCiService.Verify(s => s.PublishEventsAsync(It.Is<CustomerIntelligenceEvent[]>(e => VerifyEvent(e, data))), Times.Once());
                 Assert.True(_warnings.Count > 0);
             }
         }
 
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Telemetry")]
+        public void PublishTelemetryCommandForInBoxTask()
+        {
+            using (var _hc = SetupMocks())
+            {
+                var ex_context = _ec.Object;
+                ex_context.Variables.Set(Constants.Variables.Task.PublishTelemetry, true.ToString());
+
+                var publishTelemetryCmd = new TelemetryCommandExtension();
+                publishTelemetryCmd.Initialize(_hc);
+
+                var data = new Dictionary<string, object>()
+                {
+                    {"key1", "valu\\e1"},
+                    {"key2", "value2"},
+                    {"key3", Int64.Parse("4") }
+                };
+
+                var json = JsonConvert.SerializeObject(data, Formatting.None);
+                var cmd = new Command("telemetry", "publish");
+                cmd.Data = json;
+                cmd.Properties.Add("area", "Test");
+                cmd.Properties.Add("feature", "Task");
+
+                publishTelemetryCmd.ProcessCommand(ex_context, cmd);
+                _mockCiService.Verify(s => s.PublishEventsAsync(It.Is<CustomerIntelligenceEvent[]>(e => VerifyEvent(e, data))), Times.Once);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Telemetry")]
+        public void PublishTelemetryCommandForCustomerTask()
+        {
+            using (var _hc = SetupMocks())
+            {
+                var ex_context = _ec.Object;
+                ex_context.Variables.Set(Constants.Variables.Task.PublishTelemetry, false.ToString());
+
+                var publishTelemetryCmd = new TelemetryCommandExtension();
+                publishTelemetryCmd.Initialize(_hc);
+
+                var data = new Dictionary<string, object>()
+                {
+                    {"key1", "valu\\e1"},
+                    {"key2", "value2"},
+                    {"key3", Int64.Parse("4") }
+                };
+
+                var json = JsonConvert.SerializeObject(data, Formatting.None);
+                var cmd = new Command("telemetry", "publish");
+                cmd.Data = json;
+                cmd.Properties.Add("area", "Test");
+                cmd.Properties.Add("feature", "Task");
+
+                publishTelemetryCmd.ProcessCommand(ex_context, cmd);
+                _mockCiService.Verify(s => s.PublishEventsAsync(It.Is<CustomerIntelligenceEvent[]>(e => VerifyEvent(e, data))), Times.Never);
+            }
+        }
+
+
         private TestHostContext SetupMocks([CallerMemberName] string name = "")
         {
             var _hc = new TestHostContext(this, name);
+            _hc.SetSingleton(new TaskRestrictionsChecker() as ITaskRestrictionsChecker);
 
             _mockCiService = new Mock<ICustomerIntelligenceServer>();
             _hc.SetSingleton(_mockCiService.Object);
@@ -199,6 +262,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Telemetry
             endpointAuthorization.Parameters[EndpointAuthorizationParameters.AccessToken] = "accesstoken";
 
             _ec = new Mock<IExecutionContext>();
+            _ec.Setup(x => x.Restrictions).Returns(new List<TaskRestrictions>());
             _ec.Setup(x => x.Endpoints).Returns(new List<ServiceEndpoint> { new ServiceEndpoint { Url = new Uri("http://dummyurl"), Name = WellKnownServiceEndpointNames.SystemVssConnection, Authorization = endpointAuthorization } });
             _ec.Setup(x => x.Variables).Returns(variables);
             var asyncCommands = new List<IAsyncCommandContext>();

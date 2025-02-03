@@ -55,7 +55,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             RepositoryUrl = copy.RepositoryUrl;
             System = copy.System;
             // Let's make sure this file gets cleaned up by the garbage collector
-            LastRunOn = new DateTime(1,1,1,0,0,0,DateTimeKind.Utc);
+            LastRunOn = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         }
 
         public TrackingConfig Clone()
@@ -94,13 +94,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
             foreach (var repo in repositories)
             {
-                RepositoryTrackingInfo.Add(new Build.RepositoryTrackingInfo
-                {
-                    Identifier = repo.Alias,
-                    RepositoryType = repo.Type,
-                    RepositoryUrl = repo.Url.AbsoluteUri,
-                    SourcesDirectory = Path.Combine(SourcesDirectory, RepositoryUtil.GetCloneDirectory(repo)),
-                });
+                RepositoryTrackingInfo.Add(new Build.RepositoryTrackingInfo(repo, SourcesDirectory));
             }
 
             // Now that we have all the repositories set up, we can compute the config hash
@@ -247,6 +241,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
     public class RepositoryTrackingInfo
     {
+        public RepositoryTrackingInfo(RepositoryResource repositoryResource, string sourcesDirectoryRoot)
+        {
+            if (repositoryResource != null)
+            {
+                Identifier = repositoryResource.Alias;
+                RepositoryType = repositoryResource.Type;
+                RepositoryUrl = repositoryResource.Url.AbsoluteUri;
+                SourcesDirectory = Path.Combine(sourcesDirectoryRoot, RepositoryUtil.GetCloneDirectory(repositoryResource));
+            }
+        }
+
+        public RepositoryTrackingInfo() { }
+
         public string Identifier { get; set; }
         public string RepositoryType { get; set; }
         public string RepositoryUrl { get; set; }

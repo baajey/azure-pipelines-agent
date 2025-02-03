@@ -1,10 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using Agent.Sdk.Knob;
+using Agent.Sdk.Util;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
+using System.Linq;
+using System.Net.Sockets;
 using System.Collections.Generic;
+using Agent.Sdk;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -13,7 +18,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
     {
         void EnablePluginInternalCommand(bool enable);
         bool TryProcessCommand(IExecutionContext context, string input);
-        void SetCommandRestrictionPolicy(IWorkerCommandRestrictionPolicy policy);
     }
 
     public sealed class WorkerCommandManager : AgentService, IWorkerCommandManager
@@ -25,8 +29,6 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         private readonly object _commandSerializeLock = new object();
 
         private bool _invokePluginInternalCommand = false;
-
-        private IWorkerCommandRestrictionPolicy restrictionPolicy = new UnrestricedWorkerCommandRestrictionPolicy();
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -74,7 +76,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
             // TryParse input to Command
             Command command;
-            if (!Command.TryParse(input, out command))
+            var unescapePercents = AgentKnobs.DecodePercents.GetValue(context).AsBoolean();
+            if (!Command.TryParse(input, unescapePercents, out command))
             {
                 // if parse fail but input contains ##vso, print warning with DOC link
                 if (input.IndexOf("##vso") >= 0)
@@ -100,12 +103,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     return false;
                 }
 
-                // process logging command in serialize oreder.
+                // process logging command in serialize order.
                 lock (_commandSerializeLock)
                 {
                     try
                     {
-                        extension.ProcessCommand(context, command, restrictionPolicy);
+                        extension.ProcessCommand(context, command);
+                    }
+                    catch (SocketException ex)
+                    {
+                        using var vssConnection = WorkerUtilities.GetVssConnection(context);
+
+                        ExceptionsUtil.HandleSocketException(ex, vssConnection.Uri.ToString(), context.Error);
+                        context.CommandResult = TaskResult.Failed;
                     }
                     catch (Exception ex)
                     {
@@ -119,7 +129,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         if (!(string.Equals(command.Area, "task", StringComparison.OrdinalIgnoreCase) &&
                               string.Equals(command.Event, "debug", StringComparison.OrdinalIgnoreCase)))
                         {
-                            context.Debug($"Processed: {input}");
+                            context.Debug($"Processed: {CommandStringConvertor.Unescape(input, unescapePercents)}");
                         }
                     }
                 }
@@ -129,13 +139,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 context.Warning(StringUtil.Loc("CommandNotFound", command.Area));
             }
 
-            return true;
-        }
+            // Only if we've successfully parsed do we show this warning
+            if (AgentKnobs.DecodePercents.GetValue(context).AsString() == "" && input.Contains("%AZP25"))
+            {
+                context.Warning("%AZP25 detected in ##vso command. In March 2021, the agent command parser will be updated to unescape this to %. To opt out of this behavior, set a job level variable DECODE_PERCENTS to false. Setting to true will force this behavior immediately. More information can be found at https://github.com/microsoft/azure-pipelines-agent/blob/master/docs/design/percentEncoding.md");
+            }
 
-        public void SetCommandRestrictionPolicy(IWorkerCommandRestrictionPolicy policy)
-        {
-            ArgUtil.NotNull(policy, nameof(policy));
-            restrictionPolicy = policy;
+            return true;
         }
     }
 
@@ -145,7 +155,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         HostTypes SupportedHostTypes { get; }
 
-        void ProcessCommand(IExecutionContext context, Command command, IWorkerCommandRestrictionPolicy policy);
+        void ProcessCommand(IExecutionContext context, Command command);
     }
 
     public interface IWorkerCommand
@@ -157,43 +167,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         void Execute(IExecutionContext context, Command command);
     }
 
-    public interface IWorkerCommandRestrictionPolicy
-    {
-        bool isCommandAllowed(IWorkerCommand command);
-    }
-
-    public class UnrestricedWorkerCommandRestrictionPolicy: IWorkerCommandRestrictionPolicy
-    {
-        public bool isCommandAllowed(IWorkerCommand command)
-        {
-            return true;
-        }
-    }
-
-    [ AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
-    public sealed class CommandRestrictionAttribute : Attribute
-    {
-        public bool AllowedInRestrictedMode { get; set; }
-    }
-
-    public class AttributeBasedWorkerCommandRestrictionPolicy: IWorkerCommandRestrictionPolicy
-    {
-        public bool isCommandAllowed(IWorkerCommand command)
-        {
-            ArgUtil.NotNull(command, nameof(command));
-            foreach (var attr in command.GetType().GetCustomAttributes(typeof(CommandRestrictionAttribute), false))
-            {
-                var cra = attr as CommandRestrictionAttribute;
-                if (cra.AllowedInRestrictedMode)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
-
-    public abstract class BaseWorkerCommandExtension: AgentService, IWorkerCommandExtension
+    public abstract class BaseWorkerCommandExtension : AgentService, IWorkerCommandExtension
     {
 
         public string CommandArea { get; protected set; }
@@ -232,24 +206,21 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             return commandExecutor;
         }
 
-        public void ProcessCommand(IExecutionContext context, Command command, IWorkerCommandRestrictionPolicy restrictionPolicy)
+        public void ProcessCommand(IExecutionContext context, Command command)
         {
             ArgUtil.NotNull(context, nameof(context));
             ArgUtil.NotNull(command, nameof(command));
-            ArgUtil.NotNull(restrictionPolicy, nameof(restrictionPolicy));
 
             var commandExecutor = GetWorkerCommand(command.Event);
             if (commandExecutor == null)
             {
                 throw new Exception(StringUtil.Loc("CommandNotFound2", CommandArea.ToLowerInvariant(), command.Event, CommandArea));
             }
-            if (restrictionPolicy.isCommandAllowed(commandExecutor))
+
+            var checker = context.GetHostContext().GetService<ITaskRestrictionsChecker>();
+            if (checker.CheckCommand(context, commandExecutor, command))
             {
                 commandExecutor.Execute(context, command);
-            }
-            else
-            {
-                context.Warning(StringUtil.Loc("CommandNotAllowed", command.Area, command.Event));
             }
         }
     }

@@ -17,6 +17,9 @@ using System.Threading.Tasks;
 using Xunit;
 using Microsoft.VisualStudio.Services.Location;
 using Microsoft.VisualStudio.Services.Common;
+using Agent.Listener.Configuration;
+using Agent.Sdk;
+using System.Threading;
 
 namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
 {
@@ -38,6 +41,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
         private Mock<IMacOSServiceControlManager> _macServiceControlManager;
 
         private Mock<IRSAKeyManager> _rsaKeyManager;
+        private Mock<IFeatureFlagProvider> _featureFlagProvider;
         private ICapabilitiesManager _capabilitiesManager;
         private DeploymentGroupAgentConfigProvider _deploymentGroupAgentConfigProvider;
         private string _expectedToken = "expectedToken";
@@ -75,6 +79,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
             _linuxServiceControlManager = new Mock<ILinuxServiceControlManager>();
             _macServiceControlManager = new Mock<IMacOSServiceControlManager>();
             _capabilitiesManager = new CapabilitiesManager();
+            _featureFlagProvider = new Mock<IFeatureFlagProvider>();
 
             var expectedAgent = new TaskAgent(_expectedAgentName) { Id = 1 };
             var expectedDeploymentMachine = new DeploymentMachine() { Agent = expectedAgent, Id = _expectedDeploymentMachineId };
@@ -126,7 +131,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
 
             rsa = new RSACryptoServiceProvider(2048);
 
-            _rsaKeyManager.Setup(x => x.CreateKey()).Returns(rsa);
+            _rsaKeyManager.Setup(x => x.CreateKey(It.IsAny<bool>(), It.IsAny<bool>())).Returns(rsa);
+
+            _featureFlagProvider.Setup(x => x.GetFeatureFlagWithCred(It.IsAny<IHostContext>(), It.IsAny<string>(), It.IsAny<ITraceWriter>(), It.IsAny<AgentSettings>(), It.IsAny<VssCredentials>(), It.IsAny<CancellationToken>())).Returns(Task.FromResult(new FeatureAvailability.FeatureFlag("", "", "", "Off", "Off")));
         }
 
         private TestHostContext CreateTestContext([CallerMemberName] String testName = "")
@@ -149,6 +156,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
             tc.SetSingleton<IMacOSServiceControlManager>(_macServiceControlManager.Object);
 
             tc.SetSingleton<IRSAKeyManager>(_rsaKeyManager.Object);
+            tc.SetSingleton<IFeatureFlagProvider>(_featureFlagProvider.Object);
 
             return tc;
         }
@@ -560,11 +568,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
                 Assert.True(s.EnvironmentVMResourceId.Equals(_expectedEnvironmentVMResourceId));
 
                 // Validate mock calls
-                _environmentsServer.Verify( x => x.ConnectAsync(It.IsAny<VssConnection>()), Times.Once);
-                _environmentsServer.Verify(x => x.AddEnvironmentVMAsync(It.IsAny<Guid>(), It.Is<int>(e => e == 54 ), It.Is<VirtualMachineResource>( v => v.Agent.Name == "environmentVMResourceName")), Times.Once);
-                _environmentsServer.Verify(x => x.GetEnvironmentVMsAsync(It.IsAny<Guid>(), It.Is<int>(e => e == 54), It.Is<string>( v => v == "environmentVMResourceName")), Times.Once);
-                _environmentsServer.Verify(x => x.GetEnvironmentsAsync(It.IsAny<string>(), It.Is<string>( e => e == "env1")), Times.Once);
-                _environmentsServer.Verify(x => x.GetEnvironmentPoolAsync(It.Is<Guid>( p => p == projectId ), It.Is<int>( e => e == 54)), Times.Once);
+                _environmentsServer.Verify(x => x.ConnectAsync(It.IsAny<VssConnection>()), Times.Once);
+                _environmentsServer.Verify(x => x.AddEnvironmentVMAsync(It.IsAny<Guid>(), It.Is<int>(e => e == 54), It.Is<VirtualMachineResource>(v => v.Agent.Name == "environmentVMResourceName")), Times.Once);
+                _environmentsServer.Verify(x => x.GetEnvironmentVMsAsync(It.IsAny<Guid>(), It.Is<int>(e => e == 54), It.Is<string>(v => v == "environmentVMResourceName")), Times.Once);
+                _environmentsServer.Verify(x => x.GetEnvironmentsAsync(It.IsAny<string>(), It.Is<string>(e => e == "env1")), Times.Once);
+                _environmentsServer.Verify(x => x.GetEnvironmentPoolAsync(It.Is<Guid>(p => p == projectId), It.Is<int>(e => e == 54)), Times.Once);
             }
         }
 
@@ -602,10 +610,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Listener.Configuration
 
         private List<EnvironmentInstance> GetEnvironments(string projectName, Guid projectId)
         {
-            var environmentJson = "{'id':54, 'project':{'id':'" + projectId + "','name':'" + projectName  +"'},'name':'env1'}";
+            var environmentJson = "{'id':54, 'project':{'id':'" + projectId + "','name':'" + projectName + "'},'name':'env1'}";
             var env = JsonConvert.DeserializeObject<EnvironmentInstance>(environmentJson);
 
-            return new List<EnvironmentInstance>{ env };
+            return new List<EnvironmentInstance> { env };
         }
 
         // Init the Agent Config Provider
