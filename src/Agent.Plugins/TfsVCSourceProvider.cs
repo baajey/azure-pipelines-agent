@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
 
@@ -33,13 +34,11 @@ namespace Agent.Plugins.Repository
             }
 
             // determine if we've been asked to suppress some checkout step output
-            bool reducedOutput = StringUtil.ConvertToBoolean(
-                executionContext.Variables.GetValueOrDefault("agent.source.checkout.quiet")?.Value ??
-                System.Environment.GetEnvironmentVariable("AGENT_SOURCE_CHECKOUT_QUIET"), false);
+            bool reducedOutput = AgentKnobs.QuietCheckout.GetValue(executionContext).AsBoolean();
             if (reducedOutput)
             {
                 executionContext.Output(StringUtil.Loc("QuietCheckoutModeRequested"));
-                executionContext.SetTaskVariable("agent.source.checkout.quiet", "false");
+                executionContext.SetTaskVariable(AgentKnobs.QuietCheckoutRuntimeVarName, Boolean.TrueString);
             }
 
 
@@ -102,7 +101,8 @@ namespace Agent.Plugins.Repository
             if (PlatformUtil.RunningOnWindows)
             {
                 // Set TFVC_BUILDAGENT_POLICYPATH
-                string policyDllPath = Path.Combine(executionContext.Variables.GetValueOrDefault("Agent.HomeDirectory")?.Value, "externals", "tf", "Microsoft.TeamFoundation.VersionControl.Controls.dll");
+                string tfDirectoryName = AgentKnobs.InstallLegacyTfExe.GetValue(executionContext).AsBoolean() ? "tf-legacy" : "tf";
+                string policyDllPath = Path.Combine(executionContext.Variables.GetValueOrDefault("Agent.HomeDirectory")?.Value, "externals", tfDirectoryName, "Microsoft.TeamFoundation.VersionControl.Controls.dll");
                 ArgUtil.File(policyDllPath, nameof(policyDllPath));
                 const string policyPathEnvKey = "TFVC_BUILDAGENT_POLICYPATH";
                 executionContext.Output(StringUtil.Loc("SetEnvVar", policyPathEnvKey));
@@ -254,7 +254,7 @@ namespace Agent.Plugins.Repository
                 tfWorkspaces = await tf.WorkspacesAsync(matchWorkspaceNameOnAnyComputer: true);
                 foreach (ITfsVCWorkspace tfWorkspace in tfWorkspaces ?? new ITfsVCWorkspace[0])
                 {
-                    await tf.WorkspaceDeleteAsync(tfWorkspace);
+                    await tf.TryWorkspaceDeleteAsync(tfWorkspace);
                 }
 
                 // Recreate the sources directory.
@@ -385,7 +385,8 @@ namespace Agent.Plugins.Repository
                 }
 
                 // Unshelve.
-                await tf.UnshelveAsync(shelveset: shelvesetName);
+                bool unshelveErrorsAllowed = AgentKnobs.AllowTfvcUnshelveErrors.GetValue(executionContext).AsBoolean();
+                await tf.UnshelveAsync(shelveset: shelvesetName, unshelveErrorsAllowed);
 
                 // Ensure we undo pending changes for shelveset build at the end.
                 executionContext.SetTaskVariable("UndoShelvesetPendingChanges", bool.TrueString);
@@ -420,7 +421,14 @@ namespace Agent.Plugins.Repository
                         // Cleanup the comment file.
                         if (File.Exists(commentFile))
                         {
-                            File.Delete(commentFile);
+                            try
+                            {
+                                await IOUtil.DeleteFileWithRetry(commentFile, cancellationToken);
+                            }
+                            catch (Exception ex)
+                            {
+                                executionContext.Output($"Unable to delete comment file, ex:{ex.GetType()}");
+                            }
                         }
                     }
                 }
@@ -455,7 +463,7 @@ namespace Agent.Plugins.Repository
                 {
                     tf = new TeeCliManager();
                 }
-                
+
                 tf.CancellationToken = CancellationToken.None;
                 tf.Repository = repository;
                 tf.ExecutionContext = executionContext;

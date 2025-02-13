@@ -124,7 +124,7 @@ namespace Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipeline
                         // Validate "checkout" is only used as the first step within a phase.
                         if (phase.Steps.Any(x => x is CheckoutStep))
                         {
-                            throw new Exception($"Step '{YamlConstants.Checkout}' is currently only supported as the first step within a phase.");
+                            throw new InvalidOperationException($"Step '{YamlConstants.Checkout}' is currently only supported as the first step within a phase.");
                         }
                     }
                 }
@@ -336,7 +336,7 @@ namespace Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipeline
 
         private void ResolveTemplates(IList<IPhase> phases, String defaultRoot, CancellationToken cancellationToken, ref Int32 fileCount)
         {
-            for (int i = 0 ; i < (phases?.Count ?? 0) ; )
+            for (int i = 0; i < (phases?.Count ?? 0);)
             {
                 if (phases[i] is PhasesTemplateReference)
                 {
@@ -392,7 +392,7 @@ namespace Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipeline
 
         private void ResolveTemplates(IList<IVariable> variables, String defaultRoot, CancellationToken cancellationToken, ref Int32 fileCount)
         {
-            for (int i = 0 ; i < (variables?.Count ?? 0) ; )
+            for (int i = 0; i < (variables?.Count ?? 0);)
             {
                 if (variables[i] is VariablesTemplateReference)
                 {
@@ -423,7 +423,7 @@ namespace Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipeline
 
         private void ResolveTemplates(IList<IStep> steps, String defaultRoot, CancellationToken cancellationToken, ref Int32 fileCount)
         {
-            for (int i = 0 ; i < (steps?.Count ?? 0); )
+            for (int i = 0; i < (steps?.Count ?? 0);)
             {
                 if (steps[i] is StepsTemplateReference)
                 {
@@ -487,7 +487,7 @@ namespace Microsoft.TeamFoundation.DistributedTask.Orchestration.Server.Pipeline
         {
             stepOverrides = stepOverrides ?? new Dictionary<String, IList<ISimpleStep>>(0);
             steps = steps ?? new List<IStep>(0);
-            for (int i = 0 ; i < steps.Count ; )
+            for (int i = 0; i < steps.Count;)
             {
                 if (steps[i] is StepGroup)
                 {

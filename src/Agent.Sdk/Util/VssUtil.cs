@@ -2,10 +2,12 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net.Http;
+using System.Net.Security;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.WebApi;
@@ -18,7 +20,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
 {
     public static class VssUtil
     {
-        public static void InitializeVssClientSettings(ProductInfoHeaderValue additionalUserAgent, IWebProxy proxy, IVssClientCertificateManager clientCert)
+        private static UtilKnobValueContext _knobContext = UtilKnobValueContext.Instance();
+
+        private const string _testUri = "https://microsoft.com/";
+        private const string TaskUserAgentPrefix = "(Task:";
+        private static bool? _isCustomServerCertificateValidationSupported;
+
+        public static void InitializeVssClientSettings(ProductInfoHeaderValue additionalUserAgent, IWebProxy proxy, IVssClientCertificateManager clientCert, bool SkipServerCertificateValidation)
         {
             var headerValues = new List<ProductInfoHeaderValue>();
             headerValues.Add(additionalUserAgent);
@@ -41,30 +49,64 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
 
             VssHttpMessageHandler.DefaultWebProxy = proxy;
+
+            if (SkipServerCertificateValidation)
+            {
+                VssClientHttpRequestSettings.Default.ServerCertificateValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
         }
 
+        public static void PushTaskIntoAgentInfo(string taskName, string taskVersion)
+        {
+            var headerValues = VssClientHttpRequestSettings.Default.UserAgent;
+
+            if (headerValues == null)
+            {
+                headerValues = new List<ProductInfoHeaderValue>();
+            }
+
+            headerValues.Add(new ProductInfoHeaderValue(string.Concat(TaskUserAgentPrefix, taskName , "-" , taskVersion, ")")));
+
+            VssClientHttpRequestSettings.Default.UserAgent = headerValues;
+        }
+
+        public static void RemoveTaskFromAgentInfo()
+        {
+            var headerValues = VssClientHttpRequestSettings.Default.UserAgent;
+            if (headerValues == null)
+            {
+                return;
+            }
+
+            foreach (var value in headerValues)
+            {
+                if (value.Comment != null && value.Comment.StartsWith(TaskUserAgentPrefix))
+                {
+                    headerValues.Remove(value);
+                    break;
+                }
+            }
+
+            VssClientHttpRequestSettings.Default.UserAgent = headerValues;
+        }
 
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Maintainability", "CA2000:Dispose objects before losing scope", MessageId = "connection")]
-        public static VssConnection CreateConnection(Uri serverUri, VssCredentials credentials, IEnumerable<DelegatingHandler> additionalDelegatingHandler = null, TimeSpan? timeout = null)
+        public static VssConnection CreateConnection(
+            Uri serverUri,
+            VssCredentials credentials,
+            ITraceWriter trace,
+            bool skipServerCertificateValidation = false,
+            IEnumerable<DelegatingHandler> additionalDelegatingHandler = null,
+            TimeSpan? timeout = null)
         {
             VssClientHttpRequestSettings settings = VssClientHttpRequestSettings.Default.Clone();
 
-            int maxRetryRequest;
-            if (!int.TryParse(Environment.GetEnvironmentVariable("VSTS_HTTP_RETRY") ?? string.Empty, out maxRetryRequest))
-            {
-                maxRetryRequest = 3;
-            }
-
             // make sure MaxRetryRequest in range [3, 10]
+            int maxRetryRequest = AgentKnobs.HttpRetryCount.GetValue(_knobContext).AsInt();
             settings.MaxRetryRequest = Math.Min(Math.Max(maxRetryRequest, 3), 10);
 
-            int httpRequestTimeoutSeconds;
-            if (!int.TryParse(Environment.GetEnvironmentVariable("VSTS_HTTP_TIMEOUT") ?? string.Empty, out httpRequestTimeoutSeconds))
-            {
-                httpRequestTimeoutSeconds = 100;
-            }
-
             // prefer parameter, otherwise use httpRequestTimeoutSeconds and make sure httpRequestTimeoutSeconds in range [100, 1200]
+            int httpRequestTimeoutSeconds = AgentKnobs.HttpTimeout.GetValue(_knobContext).AsInt();
             settings.SendTimeout = timeout ?? TimeSpan.FromSeconds(Math.Min(Math.Max(httpRequestTimeoutSeconds, 100), 1200));
 
             // Remove Invariant from the list of accepted languages.
@@ -75,6 +117,13 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             // languages, then "System.ArgumentException: The value cannot be null or empty." will be thrown when the
             // settings are applied to an HttpRequestMessage.
             settings.AcceptLanguages.Remove(CultureInfo.InvariantCulture);
+
+            // Setting `ServerCertificateCustomValidation` to able to capture SSL data for diagnostic
+            if (trace != null && IsCustomServerCertificateValidationSupported(trace))
+            {
+                SslUtil sslUtil = new SslUtil(trace, skipServerCertificateValidation);
+                settings.ServerCertificateValidationCallback = sslUtil.RequestStatusCustomValidation;
+            }
 
             VssConnection connection = new VssConnection(serverUri, new VssHttpMessageHandler(credentials, settings), additionalDelegatingHandler);
             return connection;
@@ -100,6 +149,43 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
 
             return credentials;
+        }
+
+        public static bool IsCustomServerCertificateValidationSupported(ITraceWriter trace)
+        {
+            if (!PlatformUtil.RunningOnWindows && PlatformUtil.UseLegacyHttpHandler)
+            {
+                if (_isCustomServerCertificateValidationSupported == null)
+                {
+                    _isCustomServerCertificateValidationSupported = CheckSupportOfCustomServerCertificateValidation(trace);
+                }
+                return (bool)_isCustomServerCertificateValidationSupported;
+            }
+            return true;
+        }
+
+        // The function is to check if the custom server certificate validation is supported on the current platform.
+        private static bool CheckSupportOfCustomServerCertificateValidation(ITraceWriter trace)
+        {
+            using (var handler = new HttpClientHandler())
+            {
+                handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => { return errors == SslPolicyErrors.None; };
+
+                using (var client = new HttpClient(handler))
+                {
+                    try
+                    {
+                        client.GetAsync(_testUri).GetAwaiter().GetResult();
+                        trace.Verbose("Custom Server Validation Callback Successful, SSL diagnostic data collection is enabled.");
+                    }
+                    catch (Exception e)
+                    {
+                        trace.Verbose($"Custom Server Validation Callback Unsuccessful, SSL diagnostic data collection is disabled, due to issue:\n{e.Message}");
+                        return false;
+                    }
+                    return true;
+                }
+            }
         }
     }
 }

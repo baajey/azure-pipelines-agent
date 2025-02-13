@@ -5,6 +5,8 @@ using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Globalization;
 using System.Threading.Tasks;
+using Agent.Sdk;
+using Agent.Sdk.Util;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -12,11 +14,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
     {
         public static int Main(string[] args)
         {
-            // We can't use the new SocketsHttpHandler for now for both Windows and Linux
-            // On linux, Negotiate auth is not working if the TFS url is behind Https
-            // On windows, Proxy is not working
-            AppContext.SetSwitch("System.Net.Http.UseSocketsHttpHandler", false);
-            using (HostContext context = new HostContext("Worker"))
+            if (PlatformUtil.UseLegacyHttpHandler)
+            {
+                AppContext.SetSwitch("System.Net.Http.UseSocketsHttpHandler", false);
+            }
+
+            using (HostContext context = new HostContext(HostType.Worker))
             {
                 return MainAsync(context, args).GetAwaiter().GetResult();
             }
@@ -49,6 +52,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 return await worker.RunAsync(
                     pipeIn: args[1],
                     pipeOut: args[2]);
+            }
+            catch (AggregateException ex)
+            {
+                ExceptionsUtil.HandleAggregateException((AggregateException)ex, trace.Error);
             }
             catch (Exception ex)
             {

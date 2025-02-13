@@ -14,8 +14,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Common")]
+        [Trait("SkipOn", "darwin")]
         public async Task SuccessReadProcessEnv()
         {
+            // With the latest update coming with macOS 10.5.7+ there are no more any ways to retrieve
+            // information about the environment on the running process with ps utility.
+            // This test should be updated accordingly, disabling it while issue is under investigation
             using (TestHostContext hc = new TestHostContext(this))
             {
                 Tracing trace = hc.GetTrace();
@@ -61,12 +65,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                                     Assert.True(string.Equals(value, envValue, StringComparison.OrdinalIgnoreCase), "Expected environment '" + envValue + "' did not match actual '" + value + "'");
                                     break;
                                 }
-                                catch (Exception ex)
+                                catch (Exception)
                                 {
                                     retries--;
                                     if (retries < 0)
                                     {
-                                        throw ex;
+                                        throw;
                                     }
                                     trace.Info($"Unable to get the environment variable, will retry. {retries} retries remaining");
                                     await Task.Delay(2000);
@@ -86,7 +90,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                     {
                         sleep?.Kill();
                     }
-                    catch {  }
+                    catch { }
                 }
             }
         }

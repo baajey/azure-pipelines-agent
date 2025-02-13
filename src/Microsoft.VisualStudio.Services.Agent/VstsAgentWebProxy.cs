@@ -9,6 +9,8 @@ using System.IO;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using Agent.Sdk;
+using Agent.Sdk.Knob;
+using Agent.Sdk.Util;
 
 namespace Microsoft.VisualStudio.Services.Agent
 {
@@ -20,6 +22,10 @@ namespace Microsoft.VisualStudio.Services.Agent
         string ProxyPassword { get; }
         List<string> ProxyBypassList { get; }
         IWebProxy WebProxy { get; }
+        void SetupProxy(string proxyAddress, string proxyUsername, string proxyPassword);
+        void SaveProxySetting();
+        void LoadProxyBypassList();
+        void DeleteProxySetting();
     }
 
     public class VstsAgentWebProxy : AgentService, IVstsAgentWebProxy
@@ -136,16 +142,14 @@ namespace Microsoft.VisualStudio.Services.Agent
                 }
             }
 
-            foreach (var envVar in new string[] { "no_proxy" })
-            {
-                Trace.Verbose($"Try reading proxy bypass list from environment variable: '{envVar}'.");
-                var proxyBypassEnv = Environment.GetEnvironmentVariable(envVar) ?? string.Empty;
+            var proxyBypassEnv = AgentKnobs.NoProxy.GetValue(HostContext).AsString();
 
-                foreach (string bypass in proxyBypassEnv.Split(new [] {',', ';'}).Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()))
-                {
-                    Trace.Info($"Bypass proxy for: {bypass}.");
-                    ProxyBypassList.Add(bypass);
-                }
+            foreach (string bypass in proxyBypassEnv.Split(new[] { ',', ';' }).Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()))
+            {
+                var saveRegexString = ProcessProxyByPassFromEnv(bypass);
+
+                Trace.Info($"Bypass proxy for: {saveRegexString}.");
+                ProxyBypassList.Add(saveRegexString);
             }
         }
 
@@ -163,17 +167,8 @@ namespace Microsoft.VisualStudio.Services.Agent
 
             if (string.IsNullOrEmpty(ProxyAddress))
             {
-                foreach (var envVar in new string[] { "VSTS_HTTP_PROXY", "http_proxy" })
-                {
-                    Trace.Verbose($"Try reading proxy setting from environment variable: '{envVar}'.");
-                    ProxyAddress = Environment.GetEnvironmentVariable(envVar) ?? string.Empty;
-                    ProxyAddress = ProxyAddress.Trim();
-                    Trace.Verbose($"{ProxyAddress}");
-                    if (!string.IsNullOrEmpty(ProxyAddress))
-                    {
-                        break;
-                    }
-                }
+                ProxyAddress = AgentKnobs.ProxyAddress.GetValue(HostContext).AsString();
+                Trace.Verbose($"Proxy address: {ProxyAddress}");
             }
 
             if (!string.IsNullOrEmpty(ProxyAddress) && !Uri.IsWellFormedUriString(ProxyAddress, UriKind.Absolute))
@@ -201,17 +196,17 @@ namespace Microsoft.VisualStudio.Services.Agent
 
                 if (string.IsNullOrEmpty(ProxyUsername))
                 {
-                    ProxyUsername = Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY_USERNAME");
+                    ProxyUsername = AgentKnobs.ProxyUsername.GetValue(HostContext).AsString();
                 }
 
                 if (string.IsNullOrEmpty(ProxyPassword))
                 {
-                    ProxyPassword = Environment.GetEnvironmentVariable("VSTS_HTTP_PROXY_PASSWORD");
+                    ProxyPassword = AgentKnobs.ProxyPassword.GetValue(HostContext).AsString();
                 }
 
                 if (!string.IsNullOrEmpty(ProxyPassword))
                 {
-                    HostContext.SecretMasker.AddValue(ProxyPassword);
+                    HostContext.SecretMasker.AddValue(ProxyPassword, WellKnownSecretAliases.ProxyPassword);
                 }
 
                 if (string.IsNullOrEmpty(ProxyUsername) || string.IsNullOrEmpty(ProxyPassword))
@@ -231,6 +226,22 @@ namespace Microsoft.VisualStudio.Services.Agent
             {
                 Trace.Info($"No proxy setting found.");
             }
+        }
+
+        /// <summary>
+        /// Used to escape dots in proxy bypass hosts that was recieved from no_proxy variable
+        /// It is requred since we convert host string to the regular expression pattern and
+        /// all the dots that are parts of domains will be interpreted as special symbol in regular expression while converting
+        /// this leads to false positive matches while check the patterns for bepassing.
+        /// We don't escape dots that are parts of .* wildcard.
+        /// Also, we don't escape dots that are already prepended by escaping symbols.
+        /// </summary>
+        private string ProcessProxyByPassFromEnv(string bypass)
+        {
+            var regExp = new Regex("(?<!\\\\)([.])(?!\\*)");
+            var replace = "\\$1";
+
+            return regExp.Replace(bypass, replace);
         }
     }
 }

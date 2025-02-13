@@ -1,24 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using Agent.Sdk.Knob;
 using System;
-using Microsoft.TeamFoundation.TestClient.PublishTestResults;
-using Microsoft.TeamFoundation.TestManagement.WebApi;
-using Microsoft.VisualStudio.Services.WebApi;
-using Microsoft.TeamFoundation.Core.WebApi;
-using System.Linq;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
+using Microsoft.TeamFoundation.TestClient.PublishTestResults;
+using System.Linq;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
 {
     internal static class TestResultUtils
     {
-        public static void StoreTestRunSummaryInEnvVar(IExecutionContext executionContext, TestRunSummary testRunSummary, string testRunner, string name, string description="")
+        public static void StoreTestRunSummaryInEnvVar(IExecutionContext executionContext, TestRunSummary testRunSummary, string testRunner, string name, string description = "")
         {
+            if (AgentKnobs.DisableTestsMetadata.GetValue(executionContext).AsBoolean())
+            {
+                return;
+            }
+
             try
             {
                 string metadata = GetEvidenceStoreMetadata(executionContext, testRunSummary, testRunner, name, description);
@@ -32,6 +32,61 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
             {
                 executionContext.Debug($"Unable to set the METADATA_* env variable, error details: {ex}");
             }
+        }
+
+        public static TestCaseResultData CloneTestCaseResultData(TestCaseResultData original)
+        {
+            return new TestCaseResultData
+            {
+                Id = original.Id,
+                Comment = original.Comment,
+                Configuration = original.Configuration,
+                Project = original.Project,
+                StartedDate = original.StartedDate,
+                CompletedDate = original.CompletedDate,
+                DurationInMs = original.DurationInMs,
+                Outcome = original.Outcome,
+                Revision = original.Revision,
+                State = original.State,
+                TestCase = original.TestCase,
+                TestPoint = original.TestPoint,
+                TestRun = original.TestRun,
+                ResolutionStateId = original.ResolutionStateId,
+                ResolutionState = original.ResolutionState,
+                LastUpdatedDate = original.LastUpdatedDate,
+                Priority = original.Priority,
+                ComputerName = original.ComputerName,
+                ResetCount = original.ResetCount,
+                Build = original.Build,
+                Release = original.Release,
+                ErrorMessage = original.ErrorMessage,
+                CreatedDate = original.CreatedDate,
+                IterationDetails = original.IterationDetails?.ToList(),
+                AssociatedBugs = original.AssociatedBugs?.ToList(),
+                Url = original.Url,
+                FailureType = original.FailureType,
+                AutomatedTestName = original.AutomatedTestName,
+                AutomatedTestStorage = original.AutomatedTestStorage,
+                AutomatedTestType = original.AutomatedTestType,
+                AutomatedTestTypeId = original.AutomatedTestTypeId,
+                AutomatedTestId = original.AutomatedTestId,
+                Area = original.Area,
+                TestCaseTitle = original.TestCaseTitle,
+                StackTrace = original.StackTrace,
+                CustomFields = original.CustomFields?.ToList(),
+                BuildReference = original.BuildReference,
+                ReleaseReference = original.ReleaseReference,
+                TestPlan = original.TestPlan,
+                TestSuite = original.TestSuite,
+                TestCaseReferenceId = original.TestCaseReferenceId,
+                Owner = original.Owner,
+                RunBy = original.RunBy,
+                LastUpdatedBy = original.LastUpdatedBy,
+                ResultGroupType = original.ResultGroupType,
+                TestCaseRevision = original.TestCaseRevision,
+                TestCaseSubResultData = original.TestCaseSubResultData?.ToList(),
+                AttachmentData = original.AttachmentData
+            };
         }
 
         private static string GetEvidenceStoreMetadata(IExecutionContext executionContext, TestRunSummary testRunSummary, string testRunner, string name, string description)
@@ -55,7 +110,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
                 string pipelinesUrl = GetPipelinesUrl(executionContext);
                 if (!string.IsNullOrEmpty(pipelinesUrl))
                 {
-                    var relatedUrls = new[] { new RelatedUrl() { Label="pipeline-url", Url=pipelinesUrl} };
+                    var relatedUrls = new[] { new RelatedUrl() { Label = "pipeline-url", Url = pipelinesUrl } };
                     testMetadata.RelatedUrls = relatedUrls;
                     testAttestation.RelatedUrls = relatedUrls;
                 }
@@ -81,10 +136,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
 
         private static string[] GetResourceUris(IExecutionContext executionContext)
         {
-            string[] resourceUris = {};
+            string[] resourceUris = { };
             try
             {
-                var resourceUrisEnvVar = System.Environment.GetEnvironmentVariable("RESOURCE_URIS");
+                var resourceUrisEnvVar = executionContext.GetVariableValueOrDefault("RESOURCE_URIS");
                 executionContext.Debug("RESOURCE_URIS:" + resourceUrisEnvVar);
 
                 if (!string.IsNullOrEmpty(resourceUrisEnvVar))
@@ -105,14 +160,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
             try
             {
                 string hostType = executionContext.Variables.System_HostType.ToString();
-                if (string.IsNullOrEmpty(hostType)) 
+                if (string.IsNullOrEmpty(hostType))
                 {
                     return string.Empty;
                 }
 
                 bool isBuild = string.Equals(hostType, "build", StringComparison.OrdinalIgnoreCase);
                 string pipeLineId = isBuild ? executionContext.Variables.Build_BuildId.Value.ToString() : executionContext.Variables.Release_ReleaseId;
-                if(string.IsNullOrEmpty(pipeLineId))
+                if (string.IsNullOrEmpty(pipeLineId))
                 {
                     return string.Empty;
                 }
@@ -120,15 +175,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
                 string baseUri = executionContext.Variables.System_TFCollectionUrl;
                 string project = executionContext.Variables.System_TeamProject;
 
-                if(string.IsNullOrEmpty(baseUri) || string.IsNullOrEmpty(project))
+                if (string.IsNullOrEmpty(baseUri) || string.IsNullOrEmpty(project))
                 {
                     return string.Empty;
                 }
 
                 string pipelineUri;
-                if(isBuild)
+                if (isBuild)
                 {
-                    pipelineUri =  $"{baseUri.TrimEnd('/')}/{project}/_build/results?buildId={pipeLineId}";
+                    pipelineUri = $"{baseUri.TrimEnd('/')}/{project}/_build/results?buildId={pipeLineId}";
                 }
                 else
                 {
@@ -175,7 +230,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.TestResults.Utils
             this.TestId = testId;
             this.TestTool = testTool;
             this.TestResultAttestation = testRunSummary;
-            this.TestPassPercentage = (testRunSummary.Total > 0 && testRunSummary.Total - testRunSummary.Skipped > 0 ? ((double)testRunSummary.Passed/(testRunSummary.Total-testRunSummary.Skipped)) * 100 : 0).ToString();
+            this.TestPassPercentage = (testRunSummary.Total > 0 && testRunSummary.Total - testRunSummary.Skipped > 0 ? ((double)testRunSummary.Passed / (testRunSummary.Total - testRunSummary.Skipped)) * 100 : 0).ToString();
             // Will populate this in separate PR. As it required change in logic at client side.
             this.TestDurationSeconds = 0.0;
         }

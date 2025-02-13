@@ -15,5 +15,11 @@ namespace Agent.Listener.CommandLine
 
         [Option(Constants.Agent.CommandLine.Flags.Once)]
         public bool RunOnce { get; set; }
+
+        [Option(Constants.Agent.CommandLine.Args.StartupType)]
+        public string StartupType { get; set; }
+
+        [Option(Constants.Agent.CommandLine.Flags.DebugMode)]
+        public bool DebugMode { get; set; }
     }
 }

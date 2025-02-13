@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-﻿using Microsoft.VisualStudio.Services.Agent.Util;
+using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Common;
 using System;
 using System.Collections.Generic;
@@ -32,7 +32,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Util
                     trace.Info("Set httptimeout to 360.");
                     Environment.SetEnvironmentVariable("VSTS_HTTP_TIMEOUT", "360");
 
-                    using (var connect = VssUtil.CreateConnection(new Uri("https://github.com/Microsoft/vsts-agent"), new VssCredentials()))
+                    using (var connect = VssUtil.CreateConnection(new Uri("https://github.com/Microsoft/vsts-agent"), new VssCredentials(), trace: null))
                     {
 
                         // Assert.
@@ -45,7 +45,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Util
                         Environment.SetEnvironmentVariable("VSTS_HTTP_TIMEOUT", "3600");
                     }
 
-                    using (var connect = VssUtil.CreateConnection(new Uri("https://github.com/Microsoft/vsts-agent"), new VssCredentials()))
+                    using (var connect = VssUtil.CreateConnection(new Uri("https://github.com/Microsoft/vsts-agent"), new VssCredentials(), trace: null))
                     {
                         // Assert.
                         Assert.Equal(connect.Settings.MaxRetryRequest.ToString(), "10");
@@ -58,6 +58,39 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Util
                     Environment.SetEnvironmentVariable("VSTS_HTTP_TIMEOUT", "");
                 }
             }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public void VerifyVSSConnectionUsingLegacyHandler()
+        {
+            Regex _serverSideAgentPlatformMatchingRegex = new Regex("vstsagentcore-(.+)(?=/)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+            using (TestHostContext hc = new TestHostContext(this))
+            {
+                Tracing trace = hc.GetTrace();
+                // Act.
+                try
+                {
+                    Environment.SetEnvironmentVariable("AZP_AGENT_USE_LEGACY_HTTP", "true");
+
+                    var exception = Record.Exception(() =>
+                    {
+                        var connection = VssUtil.CreateConnection(
+                            new Uri("https://github.com/Microsoft/vsts-agent"),
+                            new VssCredentials(),
+                            trace);
+                    });
+
+                    Assert.Null(exception);
+                }
+                finally
+                {
+                    Environment.SetEnvironmentVariable("AZP_AGENT_USE_LEGACY_HTTP", "");
+                }
+            }
+
         }
     }
 }

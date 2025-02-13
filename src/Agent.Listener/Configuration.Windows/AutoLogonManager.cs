@@ -4,6 +4,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
@@ -12,12 +13,14 @@ using Microsoft.VisualStudio.Services.Agent.Util;
 namespace Microsoft.VisualStudio.Services.Agent.Listener.Configuration
 {
     [ServiceLocator(Default = typeof(AutoLogonManager))]
+    [SupportedOSPlatform("windows")]
     public interface IAutoLogonManager : IAgentService
     {
         Task ConfigureAsync(CommandSettings command);
         void Unconfigure();
     }
 
+    [SupportedOSPlatform("windows")]
     public class AutoLogonManager : AgentService, IAutoLogonManager
     {
         private ITerminal _terminal;
@@ -93,7 +96,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener.Configuration
                 if (!command.GetOverwriteAutoLogon(currentAutoLogonAccount))
                 {
                     Trace.Error("Marking the agent configuration as failed due to the denial of autologon setting overwriting by the user.");
-                    throw new Exception(StringUtil.Loc("AutoLogonOverwriteDeniedError", currentAutoLogonAccount));
+                    throw new InvalidOperationException(StringUtil.Loc("AutoLogonOverwriteDeniedError", currentAutoLogonAccount));
                 }
                 Trace.Info($"Continuing with the autologon configuration.");
             }

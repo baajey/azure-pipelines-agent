@@ -20,13 +20,15 @@ namespace Agent.Plugins.Repository
 
         protected override string Switch => "-";
 
+        public static readonly int RetriesOnFailure = 3;
+
         public string FilePath => Path.Combine(ExecutionContext.Variables.GetValueOrDefault("agent.homedirectory")?.Value, "externals", "tee", "tf");
 
         // TODO: Remove AddAsync after last-saved-checkin-metadata problem is fixed properly.
         public async Task AddAsync(string localPath)
         {
             ArgUtil.NotNullOrEmpty(localPath, nameof(localPath));
-            await RunPorcelainCommandAsync(FormatFlags.OmitCollectionUrl, "add", localPath);
+            await RunPorcelainCommandAsync(FormatTags.OmitCollectionUrl, "add", localPath);
         }
 
         public void CleanupProxySetting()
@@ -36,13 +38,13 @@ namespace Agent.Plugins.Repository
 
         public async Task EulaAsync()
         {
-            await RunCommandAsync(FormatFlags.All, "eula", "-accept");
+            await RunCommandAsync(FormatTags.All, "eula", "-accept");
         }
 
         public async Task GetAsync(string localPath, bool quiet = false)
         {
             ArgUtil.NotNullOrEmpty(localPath, nameof(localPath));
-            await RunCommandAsync(FormatFlags.OmitCollectionUrl, quiet, "get", $"-version:{SourceVersion}", "-recursive", "-overwrite", localPath);
+            await RunCommandAsync(FormatTags.OmitCollectionUrl, quiet, 3, "get", $"-version:{SourceVersion}", "-recursive", "-overwrite", localPath);
         }
 
         public string ResolvePath(string serverPath)
@@ -133,11 +135,11 @@ namespace Agent.Plugins.Repository
             // TODO: Remove parameter move after last-saved-checkin-metadata problem is fixed properly.
             if (move)
             {
-                await RunPorcelainCommandAsync(FormatFlags.OmitCollectionUrl, "shelve", $"-workspace:{WorkspaceName}", "-move", "-replace", "-recursive", $"-comment:@{commentFile}", shelveset);
+                await RunPorcelainCommandAsync(FormatTags.OmitCollectionUrl, "shelve", $"-workspace:{WorkspaceName}", "-move", "-replace", "-recursive", $"-comment:@{commentFile}", shelveset);
                 return;
             }
 
-            await RunPorcelainCommandAsync(FormatFlags.OmitCollectionUrl, "shelve", $"-workspace:{WorkspaceName}", "-saved", "-replace", "-recursive", $"-comment:@{commentFile}", shelveset);
+            await RunPorcelainCommandAsync(FormatTags.OmitCollectionUrl, "shelve", $"-workspace:{WorkspaceName}", "-saved", "-replace", "-recursive", $"-comment:@{commentFile}", shelveset);
         }
 
         public async Task<ITfsVCShelveset> ShelvesetsAsync(string shelveset)
@@ -164,7 +166,7 @@ namespace Agent.Plugins.Repository
         public async Task<ITfsVCStatus> StatusAsync(string localPath)
         {
             ArgUtil.NotNullOrEmpty(localPath, nameof(localPath));
-            string output = await RunPorcelainCommandAsync(FormatFlags.OmitCollectionUrl, "status", "-recursive", "-nodetect", "-format:xml", localPath);
+            string output = await RunPorcelainCommandAsync(FormatTags.OmitCollectionUrl, "status", "-recursive", "-nodetect", "-format:xml", localPath);
             string xml = ExtractXml(output);
             var serializer = new XmlSerializer(typeof(TeeStatus));
             using (var reader = new StringReader(xml ?? string.Empty))
@@ -226,26 +228,26 @@ namespace Agent.Plugins.Repository
         public async Task UndoAsync(string localPath)
         {
             ArgUtil.NotNullOrEmpty(localPath, nameof(localPath));
-            await RunCommandAsync(FormatFlags.OmitCollectionUrl, "undo", "-recursive", localPath);
+            await RunCommandAsync(FormatTags.OmitCollectionUrl, "undo", "-recursive", localPath);
         }
 
-        public async Task UnshelveAsync(string shelveset)
+        public async Task UnshelveAsync(string shelveset, bool failOnNonZeroExitCode = true)
         {
             ArgUtil.NotNullOrEmpty(shelveset, nameof(shelveset));
-            await RunCommandAsync("unshelve", "-format:detailed", $"-workspace:{WorkspaceName}", shelveset);
+            await RunCommandAsync(FormatTags.OmitCollectionUrl, false, failOnNonZeroExitCode, "unshelve", "-format:detailed", $"-workspace:{WorkspaceName}", shelveset);
         }
 
         public async Task WorkfoldCloakAsync(string serverPath)
         {
             ArgUtil.NotNullOrEmpty(serverPath, nameof(serverPath));
-            await RunCommandAsync("workfold", "-cloak", $"-workspace:{WorkspaceName}", serverPath);
+            await RunCommandAsync(3, "workfold", "-cloak", $"-workspace:{WorkspaceName}", serverPath);
         }
 
         public async Task WorkfoldMapAsync(string serverPath, string localPath)
         {
             ArgUtil.NotNullOrEmpty(serverPath, nameof(serverPath));
             ArgUtil.NotNullOrEmpty(localPath, nameof(localPath));
-            await RunCommandAsync("workfold", "-map", $"-workspace:{WorkspaceName}", serverPath, localPath);
+            await RunCommandAsync(3, "workfold", "-map", $"-workspace:{WorkspaceName}", serverPath, localPath);
         }
 
         public Task WorkfoldUnmapAsync(string serverPath)
@@ -278,7 +280,7 @@ namespace Agent.Plugins.Repository
             args.Add("-format:xml");
 
             // Run the command.
-            TfsVCPorcelainCommandResult result = await TryRunPorcelainCommandAsync(FormatFlags.None, args.ToArray());
+            TfsVCPorcelainCommandResult result = await TryRunPorcelainCommandAsync(FormatTags.None, RetriesOnFailure, args.ToArray());
             ArgUtil.NotNull(result, nameof(result));
             if (result.Exception != null)
             {

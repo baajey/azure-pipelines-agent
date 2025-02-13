@@ -7,10 +7,12 @@ using System.Security.Cryptography;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
+using System.Runtime.Versioning;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 {
     [ServiceLocator(Default = typeof(PowerShellExeHandler))]
+    [SupportedOSPlatform("windows")]
     public interface IPowerShellExeHandler : IHandler
     {
         PowerShellExeHandlerData Data { get; set; }
@@ -18,6 +20,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
         string AccessToken { get; set; }
     }
 
+    [SupportedOSPlatform("windows")]
     public sealed class PowerShellExeHandler : Handler, IPowerShellExeHandler
     {
         private const string InlineScriptType = "inlineScript";
@@ -40,11 +43,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             // Update the env dictionary.
             AddVariablesToEnvironment(excludeNames: true, excludeSecrets: true);
             AddPrependPathToEnvironment();
+            RemovePSModulePathFromEnvironment();
+
+            if (PsModulePathContainsPowershellCoreLocations())
+            {
+                ExecutionContext.Error(StringUtil.Loc("PSModulePathLocations"));
+            }
 
             // Add the access token to the environment variables, if the access token is set.
             if (!string.IsNullOrEmpty(AccessToken))
             {
-                string formattedKey = Constants.Variables.System.AccessToken.Replace('.', '_').Replace(' ', '_').ToUpperInvariant();
+                string formattedKey = VarUtil.ConvertToEnvVariableFormat(Constants.Variables.System.AccessToken, preserveCase: false);
                 AddEnvironmentVariable(formattedKey, AccessToken);
             }
 
@@ -150,6 +159,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                                                                      killProcessOnCancel: false,
                                                                      redirectStandardIn: null,
                                                                      inheritConsoleHandler: !ExecutionContext.Variables.Retain_Default_Encoding,
+                                                                     continueAfterCancelProcessTreeKillAttempt: _continueAfterCancelProcessTreeKillAttempt,
                                                                      cancellationToken: ExecutionContext.CancellationToken);
                     FlushErrorData();
 
@@ -162,14 +172,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                         }
                         else
                         {
-                            throw new Exception(StringUtil.Loc("ProcessCompletedWithCode0Errors1", exitCode, _errorCount));
+                            throw new InvalidOperationException(StringUtil.Loc("ProcessCompletedWithCode0Errors1", exitCode, _errorCount));
                         }
                     }
 
                     // Fail on non-zero exit code.
                     if (exitCode != 0)
                     {
-                        throw new Exception(StringUtil.Loc("ProcessCompletedWithExitCode0", exitCode));
+                        throw new InvalidOperationException(StringUtil.Loc("ProcessCompletedWithExitCode0", exitCode));
                     }
                 }
             }

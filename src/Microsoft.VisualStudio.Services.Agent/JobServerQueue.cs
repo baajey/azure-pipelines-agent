@@ -15,21 +15,26 @@ using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 namespace Microsoft.VisualStudio.Services.Agent
 {
     [ServiceLocator(Default = typeof(JobServerQueue))]
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1711: Identifiers should not have incorrect suffix")]
     public interface IJobServerQueue : IAgentService, IThrottlingReporter
     {
+        bool ForceDrainWebConsoleQueue { get; set; }
+        bool ForceDrainTimelineQueue { get; set; }
         event EventHandler<ThrottlingEventArgs> JobServerQueueThrottling;
         Task ShutdownAsync();
         void Start(Pipelines.AgentJobRequestMessage jobRequest);
         void QueueWebConsoleLine(Guid stepRecordId, string line, long lineNumber);
         void QueueFileUpload(Guid timelineId, Guid timelineRecordId, string type, string name, string path, bool deleteSource);
         void QueueTimelineRecordUpdate(Guid timelineId, TimelineRecord timelineRecord);
+        void UpdateWebConsoleLineRate(Int32 rateInMillis);
     }
 
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1711: Identifiers should not have incorrect suffix")]
     public sealed class JobServerQueue : AgentService, IJobServerQueue
     {
         // Default delay for Dequeue process
-        private static readonly TimeSpan _aggressiveDelayForWebConsoleLineDequeue = TimeSpan.FromMilliseconds(250);
-        private static readonly TimeSpan _delayForWebConsoleLineDequeue = TimeSpan.FromMilliseconds(500);
+        private static readonly TimeSpan _aggressiveDelayForWebConsoleLineDequeue = TimeSpan.FromMilliseconds(500);
+        private static readonly TimeSpan _delayForWebConsoleLineDequeueDefault = TimeSpan.FromMilliseconds(1000);
         private static readonly TimeSpan _delayForTimelineUpdateDequeue = TimeSpan.FromMilliseconds(500);
         private static readonly TimeSpan _delayForFileUploadDequeue = TimeSpan.FromMilliseconds(1000);
 
@@ -68,14 +73,22 @@ namespace Microsoft.VisualStudio.Services.Agent
 
         public event EventHandler<ThrottlingEventArgs> JobServerQueueThrottling;
 
-        // Web console dequeue will start with process queue every 250ms for the first 60*4 times (~60 seconds).
-        // Then the dequeue will happen every 500ms.
+        // Web console dequeue will start with process queue every 500ms for the first 15*2 times (~15 seconds).
+        // Then the dequeue will happen every 1s or whatever the server tells us
         // In this way, customer still can get instance live console output on job start,
         // at the same time we can cut the load to server after the build run for more than 60s
         private int _webConsoleLineAggressiveDequeueCount = 0;
-        private const int _webConsoleLineAggressiveDequeueLimit = 4 * 60;
+        private int _webConsoleLineUpdateRate = (int)_delayForWebConsoleLineDequeueDefault.TotalMilliseconds;
+        private const int _webConsoleLineAggressiveDequeueLimit = 2 * 15;
         private bool _webConsoleLineAggressiveDequeue = true;
+        private TaskCompletionSource<object> _webConsoleLinesDequeueNow = new TaskCompletionSource<object>();
         private bool _firstConsoleOutputs = true;
+        private bool _writeToBlobStoreLogs = false;
+        private bool _writeToBlobStoreAttachments = false;
+        private bool _debugMode = false;
+
+        public bool ForceDrainWebConsoleQueue { get; set; }
+        public bool ForceDrainTimelineQueue { get; set; }
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -102,6 +115,29 @@ namespace Microsoft.VisualStudio.Services.Agent
             _planId = jobRequest.Plan.PlanId;
             _jobTimelineId = jobRequest.Timeline.Id;
             _jobTimelineRecordId = jobRequest.JobId;
+
+            if (jobRequest.Variables.TryGetValue(WellKnownDistributedTaskVariables.LogToBlobstorageService, out var logToBlob))
+            {
+                Boolean.TryParse(logToBlob.Value, out _writeToBlobStoreLogs);
+            }
+
+            if (jobRequest.Variables.TryGetValue(WellKnownDistributedTaskVariables.UploadTimelineAttachmentsToBlob, out var attachToBlob))
+            {
+                Boolean.TryParse(attachToBlob.Value, out _writeToBlobStoreAttachments);
+            }
+
+            if (jobRequest.Variables.TryGetValue(WellKnownDistributedTaskVariables.PostLinesSpeed, out var postLinesSpeed))
+            {
+                if (!Int32.TryParse(postLinesSpeed.Value, out _webConsoleLineUpdateRate))
+                {
+                    _webConsoleLineUpdateRate = (int)_delayForWebConsoleLineDequeueDefault.TotalMilliseconds;
+                }
+            }
+
+            if (jobRequest.Variables.TryGetValue(Constants.Variables.System.Debug, out var debug))
+            {
+                Boolean.TryParse(debug.Value, out _debugMode);
+            }
 
             // Server already create the job timeline
             _timelineUpdateQueue[_jobTimelineId] = new ConcurrentQueue<TimelineRecord>();
@@ -150,7 +186,7 @@ namespace Microsoft.VisualStudio.Services.Agent
             Trace.Info("File upload queue drained.");
 
             // ProcessTimelinesUpdateQueueAsync() will throw exception during shutdown
-            // if there is any timeline records that failed to update contains output variabls.
+            // if there is any timeline records that failed to update contains output variables.
             Trace.Verbose("Draining timeline update queue.");
             await ProcessTimelinesUpdateQueueAsync(runOnce: true);
             Trace.Info("Timeline update queue drained.");
@@ -211,6 +247,12 @@ namespace Microsoft.VisualStudio.Services.Agent
         {
             while (!_jobCompletionSource.Task.IsCompleted || runOnce)
             {
+                bool shouldDrain = ForceDrainWebConsoleQueue;
+                if (ForceDrainWebConsoleQueue)
+                {
+                    ForceDrainWebConsoleQueue = false;
+                }
+
                 if (_webConsoleLineAggressiveDequeue && ++_webConsoleLineAggressiveDequeueCount > _webConsoleLineAggressiveDequeueLimit)
                 {
                     Trace.Info("Stop aggressive process web console line queue.");
@@ -242,7 +284,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     // process at most about 500 lines of web console line during regular timer dequeue task.
                     // Send the first line of output to the customer right away
                     // It might take a while to reach 500 line outputs, which would cause delays before customers see the first line
-                    if ((!runOnce && linesCounter > 500) || _firstConsoleOutputs)
+                    if ((!runOnce && !shouldDrain && linesCounter > 500) || _firstConsoleOutputs)
                     {
                         break;
                     }
@@ -277,7 +319,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                         // We batch and produce 500 lines of web console output every 500ms
                         // If customer's task produce massive of outputs, then the last queue drain run might take forever.
                         // So we will only upload the last 200 lines of each step from all buffered web console lines.
-                        if (runOnce && batchedLines.Count > 2)
+                        if ((runOnce || shouldDrain) && batchedLines.Count > 2)
                         {
                             Trace.Info($"Skip {batchedLines.Count - 2} batches web console lines for last run");
                             batchedLines = batchedLines.TakeLast(2).ToList();
@@ -314,9 +356,19 @@ namespace Microsoft.VisualStudio.Services.Agent
                 }
                 else
                 {
-                    await Task.Delay(_webConsoleLineAggressiveDequeue ? _aggressiveDelayForWebConsoleLineDequeue : _delayForWebConsoleLineDequeue);
+                    _webConsoleLinesDequeueNow = new TaskCompletionSource<object>();
+                    await Task.WhenAny(
+                        Task.Delay(_webConsoleLineAggressiveDequeue ? _aggressiveDelayForWebConsoleLineDequeue : TimeSpan.FromMilliseconds(_webConsoleLineUpdateRate)),
+                        _webConsoleLinesDequeueNow.Task);
                 }
             }
+        }
+
+        public void UpdateWebConsoleLineRate(Int32 rateInMillis)
+        {
+            _webConsoleLineUpdateRate = rateInMillis;
+            // Start running the dequeue task immediately
+            _webConsoleLinesDequeueNow?.SetResult(true);
         }
 
         private async Task ProcessFilesUploadQueueAsync(bool runOnce = false)
@@ -383,19 +435,19 @@ namespace Microsoft.VisualStudio.Services.Agent
         {
             while (!_jobCompletionSource.Task.IsCompleted || runOnce)
             {
-                List<PendingTimelineRecord> pendingUpdates = new List<PendingTimelineRecord>();
+                bool shouldDrain = ForceDrainTimelineQueue;
+
+                var pendingUpdates = new List<PendingTimelineRecord>();
                 foreach (var timeline in _allTimelines)
                 {
-                    ConcurrentQueue<TimelineRecord> recordQueue;
-                    if (_timelineUpdateQueue.TryGetValue(timeline, out recordQueue))
+                    if (_timelineUpdateQueue.TryGetValue(timeline, out ConcurrentQueue<TimelineRecord> recordQueue))
                     {
-                        List<TimelineRecord> records = new List<TimelineRecord>();
-                        TimelineRecord record;
-                        while (recordQueue.TryDequeue(out record))
+                        var records = new List<TimelineRecord>();
+                        while (recordQueue.TryDequeue(out TimelineRecord record))
                         {
                             records.Add(record);
                             // process at most 25 timeline records update for each timeline.
-                            if (!runOnce && records.Count > 25)
+                            if (!runOnce && !shouldDrain && records.Count > 25)
                             {
                                 break;
                             }
@@ -416,8 +468,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                 {
                     foreach (var update in pendingUpdates)
                     {
-                        List<TimelineRecord> bufferedRecords;
-                        if (_bufferedRetryRecords.TryGetValue(update.TimelineId, out bufferedRecords))
+                        if (_bufferedRetryRecords.TryGetValue(update.TimelineId, out List<TimelineRecord> bufferedRecords))
                         {
                             update.PendingRecords.InsertRange(0, bufferedRecords);
                         }
@@ -430,7 +481,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                             {
                                 try
                                 {
-                                    Timeline newTimeline = await _jobServer.CreateTimelineAsync(_scopeIdentifier, _hubName, _planId, detailTimeline.Details.Id, default(CancellationToken));
+                                    Timeline newTimeline = await _jobServer.CreateTimelineAsync(_scopeIdentifier, _hubName, _planId, detailTimeline.Details.Id, CancellationToken.None);
                                     _allTimelines.Add(newTimeline.Id);
                                     pendingSubtimelineUpdate = true;
                                 }
@@ -448,7 +499,7 @@ namespace Microsoft.VisualStudio.Services.Agent
 
                         try
                         {
-                            await _jobServer.UpdateTimelineRecordsAsync(_scopeIdentifier, _hubName, _planId, update.TimelineId, update.PendingRecords, default(CancellationToken));
+                            await _jobServer.UpdateTimelineRecordsAsync(_scopeIdentifier, _hubName, _planId, update.TimelineId, update.PendingRecords, CancellationToken.None);
                             if (_bufferedRetryRecords.Remove(update.TimelineId))
                             {
                                 Trace.Verbose("Cleanup buffered timeline record for timeline: {0}.", update.TimelineId);
@@ -458,7 +509,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                         {
                             Trace.Info("Catch exception during update timeline records, try to update these timeline records next time.");
                             Trace.Error(ex);
-                            _bufferedRetryRecords[update.TimelineId] = update.PendingRecords.ToList();
+                            _bufferedRetryRecords[update.TimelineId] = update.PendingRecords;
                             if (update.TimelineId == _jobTimelineId)
                             {
                                 mainTimelineRecordsUpdateErrors.Add(ex);
@@ -467,7 +518,7 @@ namespace Microsoft.VisualStudio.Services.Agent
                     }
                 }
 
-                if (runOnce)
+                if (runOnce || shouldDrain)
                 {
                     // continue process timeline records update,
                     // we might have more records need update,
@@ -478,24 +529,28 @@ namespace Microsoft.VisualStudio.Services.Agent
                     }
                     else
                     {
-                        if (mainTimelineRecordsUpdateErrors.Count > 0 &&
-                            _bufferedRetryRecords.ContainsKey(_jobTimelineId) &&
-                            _bufferedRetryRecords[_jobTimelineId] != null &&
-                            _bufferedRetryRecords[_jobTimelineId].Any(r => r.Variables.Count > 0))
+                        if (ForceDrainTimelineQueue)
                         {
-                            Trace.Info("Fail to update timeline records with output variables. Throw exception to fail the job since output variables are critical to downstream jobs.");
-                            throw new AggregateException(StringUtil.Loc("OutputVariablePublishFailed"), mainTimelineRecordsUpdateErrors);
-                        }
-                        else
-                        {
-                            break;
+                            ForceDrainTimelineQueue = false;
                         }
                     }
                 }
-                else
+
+                if (runOnce)
                 {
-                    await Task.Delay(_delayForTimelineUpdateDequeue);
+                    if (mainTimelineRecordsUpdateErrors.Count > 0 &&
+                            _bufferedRetryRecords.ContainsKey(_jobTimelineId) &&
+                            _bufferedRetryRecords[_jobTimelineId] != null &&
+                            _bufferedRetryRecords[_jobTimelineId].Any(r => r.Variables.Count > 0))
+                    {
+                        Trace.Info("Fail to update timeline records with output variables. Throw exception to fail the job since output variables are critical to downstream jobs.");
+                        throw new AggregateException(StringUtil.Loc("OutputVariablePublishFailed"), mainTimelineRecordsUpdateErrors);
+                    }
+
+                    break;
                 }
+
+                await Task.Delay(_delayForTimelineUpdateDequeue);
             }
         }
 
@@ -600,10 +655,29 @@ namespace Microsoft.VisualStudio.Services.Agent
                     // Create the log
                     var taskLog = await _jobServer.CreateLogAsync(_scopeIdentifier, _hubName, _planId, new TaskLog(String.Format(@"logs\{0:D}", file.TimelineRecordId)), default(CancellationToken));
 
-                    // Upload the contents
                     using (FileStream fs = File.Open(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
-                        var logUploaded = await _jobServer.AppendLogContentAsync(_scopeIdentifier, _hubName, _planId, taskLog.Id, fs, default(CancellationToken));
+                        if (_writeToBlobStoreLogs)
+                        {
+                            try
+                            {
+                                var blobBlockId = await _jobServer.UploadLogToBlobStore(fs, _hubName, _planId, taskLog.Id);
+                                int lineCount = File.ReadLines(file.Path).Count();
+
+                                // Notify TFS
+                                await _jobServer.AssociateLogAsync(_scopeIdentifier, _hubName, _planId, taskLog.Id, blobBlockId, lineCount, default(CancellationToken));
+                            }
+                            catch
+                            {
+                                // Fall back to FCS
+                                fs.Position = 0;
+                                await _jobServer.AppendLogContentAsync(_scopeIdentifier, _hubName, _planId, taskLog.Id, fs, default(CancellationToken));
+                            }
+                        }
+                        else
+                        {
+                            await _jobServer.AppendLogContentAsync(_scopeIdentifier, _hubName, _planId, taskLog.Id, fs, default(CancellationToken));
+                        }
                     }
 
                     // Create a new record and only set the Log field
@@ -612,10 +686,30 @@ namespace Microsoft.VisualStudio.Services.Agent
                 }
                 else
                 {
-                    // Create attachment
-                    using (FileStream fs = File.Open(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    if (_writeToBlobStoreAttachments)
                     {
-                        var result = await _jobServer.CreateAttachmentAsync(_scopeIdentifier, _hubName, _planId, file.TimelineId, file.TimelineRecordId, file.Type, file.Name, fs, default(CancellationToken));
+                        try
+                        {
+                            var (dedupId, length) = await _jobServer.UploadAttachmentToBlobStore(_debugMode, file.Path, _planId, _jobTimelineRecordId, default(CancellationToken));
+                            // Notify TFS
+                            await _jobServer.AssosciateAttachmentAsync(_scopeIdentifier, _hubName, _planId, file.TimelineId, file.TimelineRecordId, file.Type, file.Name, dedupId, (long)length, default(CancellationToken));
+                        }
+                        catch
+                        {
+                            // Fall back to file-based FCS
+                            using (FileStream fs = File.Open(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                            {
+                                var result = await _jobServer.CreateAttachmentAsync(_scopeIdentifier, _hubName, _planId, file.TimelineId, file.TimelineRecordId, file.Type, file.Name, fs, default(CancellationToken));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Create attachment
+                        using (FileStream fs = File.Open(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        {
+                            var result = await _jobServer.CreateAttachmentAsync(_scopeIdentifier, _hubName, _planId, file.TimelineId, file.TimelineRecordId, file.Type, file.Name, fs, default(CancellationToken));
+                        }
                     }
                 }
 

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.IO;
@@ -46,11 +47,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 Directory.CreateDirectory(_tempDirectory);
             }
 
-            bool overwriteTemp = jobContext.Variables.GetBoolean("VSTS_OVERWRITE_TEMP") ?? StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("VSTS_OVERWRITE_TEMP"));
-
             // TEMP and TMP on Windows
             // TMPDIR on Linux
-            if (!overwriteTemp)
+            if (!AgentKnobs.OverwriteTemp.GetValue(jobContext).AsBoolean())
             {
                 jobContext.Debug($"Skipping overwrite %TEMP% environment variable");
             }
@@ -66,7 +65,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 else
                 {
                     jobContext.Debug($"SET TMPDIR={_tempDirectory}");
-                    jobContext.SetVariable("TMPDIR", _tempDirectory, isFilePath:true);
+                    jobContext.SetVariable("TMPDIR", _tempDirectory, isFilePath: true);
                 }
             }
         }

@@ -48,9 +48,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.Artifacts
             {
                 return await response.Content.ReadAsStringAsync();
             }
-            else 
+            else
             {
-                throw new Exception(StringUtil.Loc("RMApiFailure", url, response.StatusCode));
+                throw new InvalidOperationException(StringUtil.Loc("RMApiFailure", url, response.StatusCode));
             }
         }
 

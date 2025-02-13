@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Util;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
 using Microsoft.VisualStudio.Services.Agent.Listener.Diagnostics;
@@ -14,6 +15,11 @@ using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using Microsoft.TeamFoundation.TestClient.PublishTestResults.Telemetry;
+using Microsoft.VisualStudio.Services.Agent.Listener.Telemetry;
+using System.Collections.Generic;
+using Newtonsoft.Json;
+using Agent.Sdk.Knob;
 
 namespace Microsoft.VisualStudio.Services.Agent.Listener
 {
@@ -43,7 +49,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             {
                 var agentWebProxy = HostContext.GetService<IVstsAgentWebProxy>();
                 var agentCertManager = HostContext.GetService<IAgentCertificateManager>();
-                VssUtil.InitializeVssClientSettings(HostContext.UserAgent, agentWebProxy.WebProxy, agentCertManager.VssClientCertificateManager);
+                VssUtil.InitializeVssClientSettings(HostContext.UserAgent, agentWebProxy.WebProxy, agentCertManager.VssClientCertificateManager, agentCertManager.SkipServerCertificateValidation);
 
                 _inConfigStage = true;
                 _completedCommand.Reset();
@@ -112,6 +118,21 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                     try
                     {
                         await configManager.UnconfigureAsync(command);
+                        return Constants.Agent.ReturnCode.Success;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error(ex);
+                        _term.WriteError(ex.Message);
+                        return Constants.Agent.ReturnCode.TerminatedError;
+                    }
+                }
+
+                if (command.IsReAuthCommand())
+                {
+                    try
+                    {
+                        await configManager.ReAuthAsync(command);
                         return Constants.Agent.ReturnCode.Success;
                     }
                     catch (Exception ex)
@@ -210,6 +231,20 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 Trace.Info($"Set agent startup type - {startType}");
                 HostContext.StartupType = startType;
 
+                bool debugModeEnabled = command.GetDebugMode();
+
+                if (debugModeEnabled)
+                {
+                    Trace.Warning("Agent is running in debug mode, don't use it in production");
+                    settings.DebugMode = true;
+                    store.SaveSettings(settings);
+                }
+                else if (settings.DebugMode && !debugModeEnabled)
+                {
+                    settings.DebugMode = false;
+                    store.SaveSettings(settings);
+                }
+
                 if (PlatformUtil.RunningOnWindows)
                 {
                     if (store.IsAutoLogonConfigured())
@@ -222,10 +257,39 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                         }
                         else
                         {
-                            Trace.Info($"Autologon is configured on the machine but current Agent.Listner.exe is launched from the windows service");
+                            Trace.Info($"Autologon is configured on the machine but current Agent.Listener.exe is launched from the windows service");
                         }
                     }
                 }
+
+                //Publish inital telemetry data
+                var telemetryPublisher = HostContext.GetService<IAgenetListenerTelemetryPublisher>();
+
+                try
+                {
+                    var systemVersion = PlatformUtil.GetSystemVersion();
+
+                    Dictionary<string, string> telemetryData = new Dictionary<string, string>
+                    {
+                        { "OS", PlatformUtil.GetSystemId() ?? "" },
+                        { "OSVersion", systemVersion?.Name?.ToString() ?? "" },
+                        { "OSBuild", systemVersion?.Version?.ToString() ?? "" },
+                        { "configuredAsService", $"{configuredAsService}"},
+                        { "startupType", startupTypeAsString }
+                    };
+                    var cmd = new Command("telemetry", "publish");
+                    cmd.Data = JsonConvert.SerializeObject(telemetryData);
+                    cmd.Properties.Add("area", "PipelinesTasks");
+                    cmd.Properties.Add("feature", "AgentListener");
+                    await telemetryPublisher.PublishEvent(HostContext, cmd);
+                }
+
+                catch (Exception ex)
+                {
+                    Trace.Warning($"Unable to publish telemetry data. {ex}");
+                }
+
+
                 // Run the agent interactively or as service
                 return await RunAsync(settings, command.GetRunOnce());
             }
@@ -254,7 +318,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
         private void CtrlCHandler(object sender, EventArgs e)
         {
-            _term.WriteLine("Exiting...");
+            _term.WriteLine(StringUtil.Loc("Exiting"));
             if (_inConfigStage)
             {
                 HostContext.Dispose();
@@ -292,6 +356,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
             try
             {
                 Trace.Info(nameof(RunAsync));
+
+                if (PlatformUtil.RunningOnWindows && AgentKnobs.CheckPsModulesLocations.GetValue(HostContext).AsBoolean())
+                {
+                    string psModulePath = Environment.GetEnvironmentVariable("PSModulePath");
+                    bool containsPwshLocations = PsModulePathUtil.ContainsPowershellCoreLocations(psModulePath);
+
+                    if (containsPwshLocations)
+                    {
+                        _term.WriteLine(StringUtil.Loc("PSModulePathLocations"));
+                    }
+                }
+
                 _listener = HostContext.GetService<IMessageListener>();
                 if (!await _listener.CreateSessionAsync(HostContext.AgentShutdownToken))
                 {
@@ -303,6 +379,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
 
                 IJobDispatcher jobDispatcher = null;
                 CancellationTokenSource messageQueueLoopTokenSource = CancellationTokenSource.CreateLinkedTokenSource(HostContext.AgentShutdownToken);
+                CancellationTokenSource keepAliveToken = CancellationTokenSource.CreateLinkedTokenSource(HostContext.AgentShutdownToken);
                 try
                 {
                     var notification = HostContext.GetService<IJobNotification>();
@@ -322,6 +399,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                     Task<bool> selfUpdateTask = null;
                     bool runOnceJobReceived = false;
                     jobDispatcher = HostContext.CreateService<IJobDispatcher>();
+                    TaskAgentMessage previuosMessage = null;
+
+                    _ = _listener.KeepAlive(keepAliveToken.Token);
 
                     while (!HostContext.AgentShutdownToken.IsCancellationRequested)
                     {
@@ -337,7 +417,18 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                                 if (completeTask == selfUpdateTask)
                                 {
                                     autoUpdateInProgress = false;
-                                    if (await selfUpdateTask)
+
+                                    bool agentUpdated = false;
+                                    try
+                                    {
+                                        agentUpdated = await selfUpdateTask;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Trace.Info($"Ignore agent update exception. {ex}");
+                                    }
+
+                                    if (agentUpdated)
                                     {
                                         Trace.Info("Auto update task finished at backend, an agent update is ready to apply exit the current agent instance.");
                                         Trace.Info("Stop message queue looping.");
@@ -364,6 +455,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                                     {
                                         Trace.Info("Auto update task finished at backend, there is no available agent update needs to apply, continue message queue looping.");
                                     }
+
+                                    message = previuosMessage;// if agent wasn't updated it's needed to process the previous message
+                                    previuosMessage = null;
                                 }
                             }
 
@@ -389,7 +483,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                                 }
                             }
 
-                            message = await getNextMessage; //get next message
+                            message ??= await getNextMessage; //get next message
                             HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
                             if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
                             {
@@ -416,6 +510,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                             else if (string.Equals(message.MessageType, JobRequestMessageTypes.AgentJobRequest, StringComparison.OrdinalIgnoreCase) ||
                                     string.Equals(message.MessageType, JobRequestMessageTypes.PipelineAgentJobRequest, StringComparison.OrdinalIgnoreCase))
                             {
+                                if (autoUpdateInProgress)
+                                {
+                                    previuosMessage = message;
+                                }
+
                                 if (autoUpdateInProgress || runOnceJobReceived)
                                 {
                                     skipMessageDeletion = true;
@@ -454,10 +553,19 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                                     Trace.Info($"Skip message deletion for cancellation message '{message.MessageId}'.");
                                 }
                             }
+                            else if (string.Equals(message.MessageType, JobMetadataMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                            {
+                                var metadataMessage = JsonUtility.FromString<JobMetadataMessage>(message.Body);
+                                jobDispatcher.MetadataUpdate(metadataMessage);
+                            }
                             else
                             {
                                 Trace.Error($"Received message {message.MessageId} with unsupported message type {message.MessageType}.");
                             }
+                        }
+                        catch (AggregateException e)
+                        {
+                            ExceptionsUtil.HandleAggregateException((AggregateException)e, Trace.Error);
                         }
                         finally
                         {
@@ -482,6 +590,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Listener
                 }
                 finally
                 {
+                    keepAliveToken.Dispose();
+
                     if (jobDispatcher != null)
                     {
                         await jobDispatcher.ShutdownAsync();

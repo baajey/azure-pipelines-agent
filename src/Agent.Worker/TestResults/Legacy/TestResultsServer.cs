@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-﻿using Microsoft.TeamFoundation.TestManagement.WebApi;
+using Microsoft.TeamFoundation.TestManagement.WebApi;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.FeatureAvailability.WebApi;
 using Microsoft.VisualStudio.Services.TestResults.WebApi;
@@ -23,6 +23,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
         Task<TestAttachmentReference> CreateTestRunAttachmentAsync(TestAttachmentRequestModel reqModel, string projectName, int testRunId, CancellationToken cancellationToken = default(CancellationToken));
         Task<TestAttachmentReference> CreateTestResultAttachmentAsync(TestAttachmentRequestModel reqModel, string projectName, int testRunId, int testCaseResultId, CancellationToken cancellationToken = default(CancellationToken));
         Task<TestAttachmentReference> CreateTestSubResultAttachmentAsync(TestAttachmentRequestModel reqModel, string projectName, int testRunId, int testCaseResultId, int testSubResultId, CancellationToken cancellationToken = default(CancellationToken));
+        Task<TestResultsSettings> GetTestResultsSettingsAsync(string project, TestResultsSettingsType? settingsType = null, object userState = null, CancellationToken cancellationToken = default(CancellationToken));
+        Task<TestRunStatistic> GetTestRunStatisticsAsync(string project, int runId, object userState = null,
+            CancellationToken cancellationToken = default(CancellationToken));
+        Task<TestRunStatistic> GetTestRunSummaryByOutcomeAsync(string project, int runId, object userState = null,
+            CancellationToken cancellationToken = default);
+        Task<CodeCoverageSummary> UpdateCodeCoverageSummaryAsync(VssConnection connection, string project, int buildId);
     }
 
     public class TestResultsServer : AgentService, ITestResultsServer
@@ -44,6 +50,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             {
                 TestHttpClient = connection.GetClient<TestManagementHttpClient>();
             }
+        }
+
+        public async Task<CodeCoverageSummary> UpdateCodeCoverageSummaryAsync(VssConnection connection, string project, int buildId)
+        {
+            TestResultsHttpClient tcmClient = connection.GetClient<TestResultsHttpClient>();
+            return await tcmClient.UpdateCodeCoverageSummaryAsync(project, buildId);
         }
 
         public async Task<List<TestCaseResult>> AddTestResultsToTestRunAsync(
@@ -102,6 +114,26 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
             return await TestHttpClient.CreateTestSubResultAttachmentAsync(reqModel, projectName, testRunId, testCaseResultId, testSubResultId, cancellationToken);
         }
 
+        public async Task<TestResultsSettings> GetTestResultsSettingsAsync(string project, TestResultsSettingsType? settingsType = null, object userState = null, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return await TestHttpClient.GetTestResultsSettingsAsync(project, settingsType);
+        }
+
+        public async Task<TestRunStatistic> GetTestRunStatisticsAsync(
+            string project,
+            int runId,
+            object userState = null,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return await TestHttpClient.GetTestRunStatisticsAsync(project, runId, cancellationToken);
+        }
+
+        public async Task<TestRunStatistic> GetTestRunSummaryByOutcomeAsync(string project, int runId, object userState = null,
+            CancellationToken cancellationToken = default)
+        {
+            return await TestHttpClient.GetTestRunSummaryByOutcomeAsync(project, runId, cancellationToken: cancellationToken);
+        }
+
         private static bool GetFeatureFlagState(IExecutionContext executionContext, VssConnection connection, string FFName)
         {
             try
@@ -113,7 +145,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.LegacyTestResults
                     return true;
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 executionContext.Output("Unable to get the FF: " + EnablePublishToTcmServiceDirectlyFromTaskFF + ". Reason: " + ex.Message);
             }

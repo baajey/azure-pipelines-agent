@@ -10,18 +10,59 @@ using System.Threading.Tasks;
 using System;
 using Newtonsoft.Json.Linq;
 using System.Text.RegularExpressions;
+using System.Linq;
+using System.Collections.Generic;
+using System.Threading;
+using StringUtil = Microsoft.VisualStudio.Services.Agent.Util.StringUtil;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
 {
     [ServiceLocator(Default = typeof(NodeHandler))]
     public interface INodeHandler : IHandler
     {
-        // Data can be of these two types: NodeHandlerData, and Node10HandlerData
+        // Data can be of these four types: NodeHandlerData, Node10HandlerData, Node16HandlerData and Node20_1HandlerData
         BaseNodeHandlerData Data { get; set; }
+    }
+
+    [ServiceLocator(Default = typeof(NodeHandlerHelper))]
+    public interface INodeHandlerHelper
+    {
+        string[] GetFilteredPossibleNodeFolders(string nodeFolderName, string[] possibleNodeFolders);
+        string GetNodeFolderPath(string nodeFolderName, IHostContext hostContext);
+        bool IsNodeFolderExist(string nodeFolderName, IHostContext hostContext);
+    }
+
+    public class NodeHandlerHelper : INodeHandlerHelper
+    {
+        public bool IsNodeFolderExist(string nodeFolderName, IHostContext hostContext) => File.Exists(GetNodeFolderPath(nodeFolderName, hostContext));
+
+        public string GetNodeFolderPath(string nodeFolderName, IHostContext hostContext) => Path.Combine(
+            hostContext.GetDirectory(WellKnownDirectory.Externals),
+            nodeFolderName,
+            "bin",
+            $"node{IOUtil.ExeExtension}");
+
+        public string[] GetFilteredPossibleNodeFolders(string nodeFolderName, string[] possibleNodeFolders)
+        {
+            int nodeFolderIndex = Array.IndexOf(possibleNodeFolders, nodeFolderName);
+
+            return nodeFolderIndex >= 0 ?
+                possibleNodeFolders.Skip(nodeFolderIndex + 1).ToArray()
+                : Array.Empty<string>();
+        }
     }
 
     public sealed class NodeHandler : Handler, INodeHandler
     {
+        private readonly INodeHandlerHelper nodeHandlerHelper;
+        private const string node10Folder = "node10";
+        internal const string NodeFolder = "node";
+        internal static readonly string Node16Folder = "node16";
+        internal static readonly string Node20_1Folder = "node20_1";
+        private static readonly string nodeLTS = Node16Folder;
+        private const string useNodeKnobLtsKey = "LTS";
+        private const string useNodeKnobUpgradeKey = "UPGRADE";
+        private string[] possibleNodeFolders = { NodeFolder, node10Folder, Node16Folder, Node20_1Folder };
         private static Regex _vstsTaskLibVersionNeedsFix = new Regex("^[0-2]\\.[0-9]+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static string[] _extensionsNode6 ={
             "if (process.versions.node && process.versions.node.match(/^5\\./)) {",
@@ -41,6 +82,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             "   return str1 === str;",
             "};"
         };
+        private bool? supportsNode20;
+
+        public NodeHandler()
+        {
+            this.nodeHandlerHelper = new NodeHandlerHelper();
+        }
+
+        public NodeHandler(INodeHandlerHelper nodeHandlerHelper)
+        {
+            this.nodeHandlerHelper = nodeHandlerHelper;
+        }
 
         public BaseNodeHandlerData Data { get; set; }
 
@@ -53,7 +105,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             ArgUtil.NotNull(Inputs, nameof(Inputs));
             ArgUtil.Directory(TaskDirectory, nameof(TaskDirectory));
 
-            if (!PlatformUtil.RunningOnWindows)
+            if (!PlatformUtil.RunningOnWindows && !AgentKnobs.IgnoreVSTSTaskLib.GetValue(ExecutionContext).AsBoolean())
             {
                 // Ensure compat vso-task-lib exist at the root of _work folder
                 // This will make vsts-agent work against 2015 RTM/QU1 TFS, since tasks in those version doesn't package with task lib
@@ -99,8 +151,15 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             // as long as vsts-task-lib be loaded into memory, it will overwrite the implementation node 6.x has,
             // so any script that use the second parameter (length) will encounter unexpected result.
             // to avoid customer hit this error, we will modify the file (extensions.js) under vsts-task-lib module folder when customer choose to use Node 6.x
-            Trace.Info("Inspect node_modules folder, make sure vsts-task-lib doesn't overwrite String.startsWith/endsWith.");
-            FixVstsTaskLibModule();
+            if (!AgentKnobs.IgnoreVSTSTaskLib.GetValue(ExecutionContext).AsBoolean())
+            {
+                Trace.Info("Inspect node_modules folder, make sure vsts-task-lib doesn't overwrite String.startsWith/endsWith.");
+                FixVstsTaskLibModule();
+            }
+            else
+            {
+                Trace.Info("AZP_AGENT_IGNORE_VSTSTASKLIB enabled, ignoring fix");
+            }
 
             StepHost.OutputDataReceived += OnDataReceived;
             StepHost.ErrorDataReceived += OnDataReceived;
@@ -112,7 +171,36 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
             }
             else
             {
-                file = GetNodeLocation();
+                bool useNode20InUnsupportedSystem = AgentKnobs.UseNode20InUnsupportedSystem.GetValue(ExecutionContext).AsBoolean();
+                bool node20ResultsInGlibCErrorHost = false;
+
+                if (PlatformUtil.HostOS == PlatformUtil.OS.Linux && !useNode20InUnsupportedSystem)
+                {
+                    if (supportsNode20.HasValue)
+                    {
+                        node20ResultsInGlibCErrorHost = supportsNode20.Value;
+                    }
+                    else
+                    {
+                        node20ResultsInGlibCErrorHost = await CheckIfNode20ResultsInGlibCError();
+
+                        ExecutionContext.EmitHostNode20FallbackTelemetry(node20ResultsInGlibCErrorHost);
+
+                        supportsNode20 = node20ResultsInGlibCErrorHost;
+                    }
+                }
+
+                ContainerInfo container = (ExecutionContext.StepTarget() as ContainerInfo);
+                if (container == null)
+                {
+                    file = GetNodeLocation(node20ResultsInGlibCErrorHost, inContainer: false);
+                }
+                else
+                {
+                    file = GetNodeLocation(container.NeedsNode16Redirect, inContainer: true);
+                }
+
+                ExecutionContext.Debug("Using node path: " + file);
             }
 
             // Format the arguments passed to node.
@@ -128,45 +216,216 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                 outputEncoding = Encoding.UTF8;
             }
 
-            // Execute the process. Exit code 0 should always be returned.
-            // A non-zero exit code indicates infrastructural failure.
-            // Task failure should be communicated over STDOUT using ## commands.
-            Task step = StepHost.ExecuteAsync(workingDirectory: StepHost.ResolvePathForStepHost(workingDirectory),
-                                              fileName: StepHost.ResolvePathForStepHost(file),
-                                              arguments: arguments,
-                                              environment: Environment,
-                                              requireExitCodeZero: true,
-                                              outputEncoding: outputEncoding,
-                                              killProcessOnCancel: false,
-                                              inheritConsoleHandler: !ExecutionContext.Variables.Retain_Default_Encoding,
-                                              cancellationToken: ExecutionContext.CancellationToken);
+            var enableResourceUtilizationWarnings = AgentKnobs.EnableResourceUtilizationWarnings.GetValue(ExecutionContext).AsBoolean();
+            var sigintTimeout = TimeSpan.FromMilliseconds(AgentKnobs.ProccessSigintTimeout.GetValue(ExecutionContext).AsInt());
+            var sigtermTimeout = TimeSpan.FromMilliseconds(AgentKnobs.ProccessSigtermTimeout.GetValue(ExecutionContext).AsInt());
+            var useGracefulShutdown = AgentKnobs.UseGracefulProcessShutdown.GetValue(ExecutionContext).AsBoolean();
 
-            // Wait for either the node exit or force finish through ##vso command
-            await System.Threading.Tasks.Task.WhenAny(step, ExecutionContext.ForceCompleted);
-
-            if (ExecutionContext.ForceCompleted.IsCompleted)
+            var configStore = HostContext.GetService<IConfigurationStore>();
+            var agentSettings = configStore.GetSettings();
+            if (agentSettings.DebugMode)
             {
-                ExecutionContext.Debug("The task was marked as \"done\", but the process has not closed after 5 seconds. Treating the task as complete.");
+                var debugTask = AgentKnobs.DebugTask.GetValue(ExecutionContext).AsString();
+                if (!string.IsNullOrEmpty(debugTask))
+                {
+                    if (string.Equals(Task?.Id.ToString("D"), debugTask, StringComparison.OrdinalIgnoreCase) || string.Equals(Task?.Name, debugTask, StringComparison.OrdinalIgnoreCase))
+                    {
+                        arguments = $"--inspect-brk {arguments}";
+                    }
+                }
             }
-            else
+            
+
+            try
             {
-                await step;
+                // Execute the process. Exit code 0 should always be returned.
+                // A non-zero exit code indicates infrastructural failure.
+                // Task failure should be communicated over STDOUT using ## commands.
+                Task step = StepHost.ExecuteAsync(workingDirectory: StepHost.ResolvePathForStepHost(workingDirectory),
+                                                  fileName: StepHost.ResolvePathForStepHost(file),
+                                                  arguments: arguments,
+                                                  environment: Environment,
+                                                  requireExitCodeZero: true,
+                                                  outputEncoding: outputEncoding,
+                                                  killProcessOnCancel: false,
+                                                  inheritConsoleHandler: !ExecutionContext.Variables.Retain_Default_Encoding,
+                                                  continueAfterCancelProcessTreeKillAttempt: _continueAfterCancelProcessTreeKillAttempt,
+                                                  sigintTimeout: sigintTimeout,
+                                                  sigtermTimeout: sigtermTimeout,
+                                                  useGracefulShutdown: useGracefulShutdown,
+                                                  cancellationToken: ExecutionContext.CancellationToken);
+
+                // Wait for either the node exit or force finish through ##vso command
+                await System.Threading.Tasks.Task.WhenAny(step, ExecutionContext.ForceCompleted);
+
+                if (ExecutionContext.ForceCompleted.IsCompleted)
+                {
+                    ExecutionContext.Debug("The task was marked as \"done\", but the process has not closed after 5 seconds. Treating the task as complete.");
+                }
+                else
+                {
+                    await step;
+                }
+            }
+            catch (ProcessExitCodeException ex)
+            {
+                if (enableResourceUtilizationWarnings && ex.ExitCode == 137)
+                {
+                    ExecutionContext.Error(StringUtil.Loc("AgentOutOfMemoryFailure"));
+                }
+
+                throw;
+            }
+            finally
+            {
+                StepHost.OutputDataReceived -= OnDataReceived;
+                StepHost.ErrorDataReceived -= OnDataReceived;
             }
         }
 
-        public string GetNodeLocation()
+        private async Task<bool> CheckIfNode20ResultsInGlibCError()
+        {
+            var node20 = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), NodeHandler.Node20_1Folder, "bin", $"node{IOUtil.ExeExtension}");
+            List<string> nodeVersionOutput = await ExecuteCommandAsync(ExecutionContext, node20, "-v", requireZeroExitCode: false, showOutputOnFailureOnly: true);
+            var node20ResultsInGlibCError = WorkerUtilities.IsCommandResultGlibcError(ExecutionContext, nodeVersionOutput, out string nodeInfoLine);
+
+            return node20ResultsInGlibCError;
+        }
+
+        public string GetNodeLocation(bool node20ResultsInGlibCError, bool inContainer)
         {
             bool useNode10 = AgentKnobs.UseNode10.GetValue(ExecutionContext).AsBoolean();
-
+            bool useNode20_1 = AgentKnobs.UseNode20_1.GetValue(ExecutionContext).AsBoolean();
+            bool UseNode20InUnsupportedSystem = AgentKnobs.UseNode20InUnsupportedSystem.GetValue(ExecutionContext).AsBoolean();
             bool taskHasNode10Data = Data is Node10HandlerData;
-            string nodeFolder = (taskHasNode10Data || useNode10) ? "node10" : "node";
+            bool taskHasNode16Data = Data is Node16HandlerData;
+            bool taskHasNode20_1Data = Data is Node20_1HandlerData;
+            string useNodeKnob = AgentKnobs.UseNode.GetValue(ExecutionContext).AsString();
 
-            Trace.Info($"Task.json has node10 handler data: {taskHasNode10Data}, use node10 for node tasks: {useNode10}");
+            string nodeFolder = NodeHandler.NodeFolder;
 
-            return Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals),
-                nodeFolder,
-                "bin",
-                $"node{IOUtil.ExeExtension}");
+            if (taskHasNode20_1Data)
+            {
+                Trace.Info($"Task.json has node20_1 handler data: {taskHasNode20_1Data} node20ResultsInGlibCError = {node20ResultsInGlibCError}");
+
+                if (node20ResultsInGlibCError)
+                {
+                    nodeFolder = NodeHandler.Node16Folder;
+                    Node16FallbackWarning(inContainer);
+                }
+                else
+                {
+                    nodeFolder = NodeHandler.Node20_1Folder;
+                }
+            }
+            else if (taskHasNode16Data)
+            {
+                Trace.Info($"Task.json has node16 handler data: {taskHasNode16Data}");
+                nodeFolder = NodeHandler.Node16Folder;
+            }
+            else if (taskHasNode10Data)
+            {
+                Trace.Info($"Task.json has node10 handler data: {taskHasNode10Data}");
+                nodeFolder = NodeHandler.node10Folder;
+            }
+            else if (PlatformUtil.RunningOnAlpine)
+            {
+                Trace.Info($"Detected Alpine, using node10 instead of node (6)");
+                nodeFolder = NodeHandler.node10Folder;
+            }
+
+            if (useNode20_1)
+            {
+                Trace.Info($"Found UseNode20_1 knob, using node20_1 for node tasks {useNode20_1} node20ResultsInGlibCError = {node20ResultsInGlibCError}");
+
+                if (node20ResultsInGlibCError)
+                {
+                    nodeFolder = NodeHandler.Node16Folder;
+                    Node16FallbackWarning(inContainer);
+                }
+                else
+                {
+                    nodeFolder = NodeHandler.Node20_1Folder;
+                }
+            }
+
+            if (useNode10)
+            {
+                Trace.Info($"Found UseNode10 knob, use node10 for node tasks: {useNode10}");
+                nodeFolder = NodeHandler.node10Folder;
+            }
+            if (nodeFolder == NodeHandler.NodeFolder &&
+                AgentKnobs.AgentDeprecatedNodeWarnings.GetValue(ExecutionContext).AsBoolean() == true)
+            {
+                ExecutionContext.Warning(StringUtil.Loc("DeprecatedRunner", Task.Name.ToString()));
+            }
+
+            if (!nodeHandlerHelper.IsNodeFolderExist(nodeFolder, HostContext))
+            {
+                string[] filteredPossibleNodeFolders = nodeHandlerHelper.GetFilteredPossibleNodeFolders(nodeFolder, possibleNodeFolders);
+
+                if (!String.IsNullOrWhiteSpace(useNodeKnob) && filteredPossibleNodeFolders.Length > 0)
+                {
+                    Trace.Info($"Found UseNode knob with value \"{useNodeKnob}\", will try to find appropriate Node Runner");
+
+                    switch (useNodeKnob.ToUpper())
+                    {
+                        case NodeHandler.useNodeKnobLtsKey:
+                            if (nodeHandlerHelper.IsNodeFolderExist(NodeHandler.nodeLTS, HostContext))
+                            {
+                                ExecutionContext.Warning($"Configured runner {nodeFolder} is not available, latest LTS version {NodeHandler.nodeLTS} will be used. See http://aka.ms/azdo-node-runner");
+                                Trace.Info($"Found LTS version of node installed");
+                                return nodeHandlerHelper.GetNodeFolderPath(NodeHandler.nodeLTS, HostContext);
+                            }
+                            break;
+                        case NodeHandler.useNodeKnobUpgradeKey:
+                            string firstExistedNodeFolder = filteredPossibleNodeFolders.FirstOrDefault(nf => nodeHandlerHelper.IsNodeFolderExist(nf, HostContext));
+
+                            if (firstExistedNodeFolder != null)
+                            {
+                                ExecutionContext.Warning($"Configured runner {nodeFolder} is not available, next available version will be used. See http://aka.ms/azdo-node-runner");
+                                Trace.Info($"Found {firstExistedNodeFolder} installed");
+                                return nodeHandlerHelper.GetNodeFolderPath(firstExistedNodeFolder, HostContext);
+                            }
+                            break;
+                        default:
+                            Trace.Error($"Value of UseNode knob cannot be recognized");
+                            break;
+                    }
+                }
+
+                throw new FileNotFoundException(StringUtil.Loc("MissingNodePath", nodeHandlerHelper.GetNodeFolderPath(nodeFolder, HostContext)));
+            }
+            if (AgentKnobs.UseNewNodeHandlerTelemetry.GetValue(ExecutionContext).AsBoolean())
+            {
+                try
+                {
+                    PublishHandlerTelemetry(nodeFolder);
+                }
+                catch (Exception ex) when (ex is FormatException || ex is ArgumentNullException || ex is NullReferenceException)
+                {
+                    ExecutionContext.Debug($"NodeHandler ExecutionHandler telemetry wasn't published, because one of the variables has unexpected value.");
+                    ExecutionContext.Debug(ex.ToString());
+                }
+            }
+
+            return nodeHandlerHelper.GetNodeFolderPath(nodeFolder, HostContext);
+        }
+
+        private void Node16FallbackWarning(bool inContainer)
+        {
+            if (inContainer)
+            {
+                ExecutionContext.Warning($"The container operating system doesn't support Node20. Using Node16 instead. " +
+                                "Please upgrade the operating system of the container to remain compatible with future updates of tasks: " +
+                                "https://github.com/nodesource/distributions");
+            }
+            else
+            {
+                ExecutionContext.Warning($"The agent operating system doesn't support Node20. Using Node16 instead. " +
+                            "Please upgrade the operating system of the agent to remain compatible with future updates of tasks: " +
+                            "https://github.com/nodesource/distributions");
+            }
         }
 
         private void OnDataReceived(object sender, ProcessDataReceivedEventArgs e)
@@ -233,6 +492,97 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Handlers
                     Trace.Error(ex);
                 }
             }
+        }
+
+        private async Task<List<string>> ExecuteCommandAsync(IExecutionContext context, string command, string arg, bool requireZeroExitCode, bool showOutputOnFailureOnly)
+        {
+            string commandLog = $"{command} {arg}";
+            if (!showOutputOnFailureOnly)
+            {
+                context.Command(commandLog);
+            }
+
+            List<string> outputs = new List<string>();
+            object outputLock = new object();
+            var processInvoker = HostContext.CreateService<IProcessInvoker>();
+            processInvoker.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
+            {
+                if (!string.IsNullOrEmpty(message.Data))
+                {
+                    lock (outputLock)
+                    {
+                        outputs.Add(message.Data);
+                    }
+                }
+            };
+
+            processInvoker.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs message)
+            {
+                if (!string.IsNullOrEmpty(message.Data))
+                {
+                    lock (outputLock)
+                    {
+                        outputs.Add(message.Data);
+                    }
+                }
+            };
+
+            var exitCode = await processInvoker.ExecuteAsync(
+                            workingDirectory: HostContext.GetDirectory(WellKnownDirectory.Work),
+                            fileName: command,
+                            arguments: arg,
+                            environment: null,
+                            requireExitCodeZero: requireZeroExitCode,
+                            outputEncoding: null,
+                            cancellationToken: CancellationToken.None);
+
+            if ((showOutputOnFailureOnly && exitCode != 0) || !showOutputOnFailureOnly)
+            {
+                if (showOutputOnFailureOnly)
+                {
+                    context.Command(commandLog);
+                }
+
+                foreach (var outputLine in outputs)
+                {
+                    context.Output(outputLine);
+                }
+            }
+
+            return outputs;
+        }
+
+        private void PublishHandlerTelemetry(string realHandler)
+        {
+            var systemVersion = PlatformUtil.GetSystemVersion();
+            string expectedHandler = "";
+            expectedHandler = Data switch
+            {
+                Node20_1HandlerData => "Node20",
+                Node16HandlerData => "Node16",
+                Node10HandlerData => "Node10",
+                _ => "Node6",
+            };
+
+            Dictionary<string, string> telemetryData = new Dictionary<string, string>
+            {
+                { "TaskName", Task.Name },
+                { "TaskId", Task.Id.ToString() },
+                { "Version", Task.Version },
+                { "OS", PlatformUtil.GetSystemId() ?? "" },
+                { "OSVersion", systemVersion?.Name?.ToString() ?? "" },
+                { "OSBuild", systemVersion?.Version?.ToString() ?? "" },
+                { "ExpectedExecutionHandler", expectedHandler },
+                { "RealExecutionHandler", realHandler },
+                { "JobId", ExecutionContext.Variables.System_JobId.ToString()},
+                { "PlanId", ExecutionContext.Variables.Get(Constants.Variables.System.PlanId)},
+                { "AgentName", ExecutionContext.Variables.Get(Constants.Variables.Agent.Name)},
+                { "MachineName", ExecutionContext.Variables.Get(Constants.Variables.Agent.MachineName)},
+                { "IsSelfHosted", ExecutionContext.Variables.Get(Constants.Variables.Agent.IsSelfHosted)},
+                { "IsAzureVM", ExecutionContext.Variables.Get(Constants.Variables.System.IsAzureVM)},
+                { "IsDockerContainer", ExecutionContext.Variables.Get(Constants.Variables.System.IsDockerContainer)}
+            };
+            ExecutionContext.PublishTaskRunnerTelemetry(telemetryData);
         }
     }
 }

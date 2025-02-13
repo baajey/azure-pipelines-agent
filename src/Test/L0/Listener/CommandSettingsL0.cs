@@ -1,17 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using Agent.Sdk;
 using Microsoft.VisualStudio.Services.Agent.Listener;
 using Microsoft.VisualStudio.Services.Agent.Listener.Configuration;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Moq;
 using System;
-using System.Collections.Generic;
-using System.Reflection;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using Xunit;
-using Agent.Sdk;
-using System.Linq;
 
 namespace Microsoft.VisualStudio.Services.Agent.Tests
 {
@@ -30,6 +28,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             {
                 // Arrange.
                 var command = new CommandSettings(hc, args: new string[] { "configure", "--agent", "some agent" });
+
+                // Act.
+                string actual = command.GetAgentName();
+
+                // Assert.
+                Assert.Equal("some agent", actual);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", nameof(CommandSettings))]
+        public void GetsArgCaseInsensitive()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                // Arrange.
+                var command = new CommandSettings(hc, args: new string[] { "configure", "--AgenT", "some agent" });
 
                 // Act.
                 string actual = command.GetAgentName();
@@ -216,6 +232,24 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", nameof(CommandSettings))]
+        public void GetsCommandReAuth()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                // Arrange.
+                var command = new CommandSettings(hc, args: new string[] { "reauth" });
+
+                // Act.
+                bool actual = command.IsReAuthCommand();
+
+                // Assert.
+                Assert.True(actual);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", nameof(CommandSettings))]
         public void GetsFlagAcceptTeeEula()
         {
             using (TestHostContext hc = CreateTestContext())
@@ -288,6 +322,26 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", nameof(CommandSettings))]
+        public void GetsStartUpType()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                string expected = "test";
+
+                // Arrange.
+                var command = new CommandSettings(hc, args: new string[] { "run", "--startuptype", expected });
+
+                // Act.
+                string actual = command.GetStartupType();
+
+                // Assert.
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", nameof(CommandSettings))]
         public void GetsFlagRunAsService()
         {
             using (TestHostContext hc = CreateTestContext())
@@ -311,7 +365,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             using (TestHostContext hc = CreateTestContext())
             {
                 // Arrange.
-                var command = new CommandSettings(hc, args: new string[] { "configure","--unattended" });
+                var command = new CommandSettings(hc, args: new string[] { "configure", "--unattended" });
 
                 // Act.
                 bool actual = command.Unattended();
@@ -473,7 +527,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
             using (TestHostContext hc = CreateTestContext())
             {
                 // Arrange.
-                var command = new CommandSettings(hc, args: new string[] { "configure"});
+                var command = new CommandSettings(hc, args: new string[] { "configure" });
                 _promptManager
                     .Setup(x => x.ReadValue(
                         Constants.Agent.CommandLine.Args.Auth, // argName
@@ -1031,7 +1085,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
 
                 // Validate if --machinegroupname parameter is working
                 Assert.Equal("Test-MachineGroupName", actual);
-                
+
                 // Validate Read Value should not get invoked.
                 _promptManager.Verify(x =>
                     x.ReadValue(It.IsAny<string>(), It.IsAny<string>(),
@@ -1096,11 +1150,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
 
                 // Validate if --machinegrouptags parameter is working fine
                 Assert.Equal("Test-MachineGrouptag1,Test-MachineGrouptag2", actual);
-                
+
                 // Validate Read Value should not get invoked.
                 _promptManager.Verify(x =>
                     x.ReadValue(It.IsAny<string>(), It.IsAny<string>(),
-                        It.IsAny<bool>(),It.IsAny<string>(), It.IsAny<Func<string,bool>>(),It.IsAny<bool>()), Times.Never);
+                        It.IsAny<bool>(), It.IsAny<string>(), It.IsAny<Func<string, bool>>(), It.IsAny<bool>()), Times.Never);
             }
         }
 
@@ -1115,7 +1169,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 var command = new CommandSettings(hc, args: new string[] { "badcommand" });
 
                 // Assert.
-                Assert.True(command.ParseErrors.Count() > 0);
+                Assert.True(command.ParseErrors.Any());
             }
         }
 
@@ -1130,7 +1184,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 var command = new CommandSettings(hc, args: new string[] { "--badflag" });
 
                 // Assert.
-                Assert.True(command.ParseErrors.Count() > 0);
+                Assert.True(command.ParseErrors.Any());
             }
         }
 
@@ -1145,7 +1199,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests
                 var command = new CommandSettings(hc, args: new string[] { "--badargname", "bad arg value" });
 
                 // Assert.
-                Assert.True(command.ParseErrors.Count() > 0);
+                Assert.True(command.ParseErrors.Any());
             }
         }
 

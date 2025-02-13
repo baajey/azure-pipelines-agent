@@ -2,18 +2,21 @@
 // Licensed under the MIT License.
 
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Threading.Tasks;
-using System.Threading;
 using Microsoft.TeamFoundation.DistributedTask.Expressions;
 using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Microsoft.VisualStudio.Services.Agent.Worker.Telemetry;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Agent.Worker.Handlers;
+using Microsoft.VisualStudio.Services.Agent.Worker.Container;
+using Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Newtonsoft.Json;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -51,6 +54,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
         public Pipelines.StepTarget Target => Task?.Target;
 
+        const int RetryCountOnTaskFailureLimit = 10;
+
         public async Task RunAsync()
         {
             // Validate args.
@@ -58,13 +63,43 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             ArgUtil.NotNull(ExecutionContext, nameof(ExecutionContext));
             ArgUtil.NotNull(ExecutionContext.Variables, nameof(ExecutionContext.Variables));
             ArgUtil.NotNull(Task, nameof(Task));
+
+            bool logTaskNameInUserAgent = AgentKnobs.LogTaskNameInUserAgent.GetValue(ExecutionContext).AsBoolean();
+
+            if (logTaskNameInUserAgent)
+            {
+                VssUtil.PushTaskIntoAgentInfo(Task.Name ?? "", Task.Reference?.Version ?? "");
+            }
+
+            try
+            {
+                await RunAsyncInternal();
+            }
+            finally
+            {
+                if (logTaskNameInUserAgent)
+                {
+                    VssUtil.RemoveTaskFromAgentInfo();
+                }
+            }
+        }
+
+        private async Task RunAsyncInternal()
+        {
             var taskManager = HostContext.GetService<ITaskManager>();
             var handlerFactory = HostContext.GetService<IHandlerFactory>();
+
+            Trace.Info($"Allow publishing telemetry for {Task.Reference.Name}@{Task.Reference.Version} task: {IsTelemetryPublishRequired()}");
+
+            // Enable skip for string translator in case of checkout task.
+            // It's required for support of multiply checkout tasks with repo alias "self" in container jobs. Reported in issue 3520.
+            this.ExecutionContext.Variables.Set(Constants.Variables.Task.SkipTranslatorForCheckout, this.Task.IsCheckoutTask().ToString());
 
             // Set the task id and display name variable.
             using (var scope = ExecutionContext.Variables.CreateScope())
             {
                 scope.Set(Constants.Variables.Task.DisplayName, DisplayName);
+                scope.Set(Constants.Variables.Task.PublishTelemetry, IsTelemetryPublishRequired().ToString());
                 scope.Set(WellKnownDistributedTaskVariables.TaskInstanceId, Task.Id.ToString("D"));
                 scope.Set(WellKnownDistributedTaskVariables.TaskDisplayName, DisplayName);
                 scope.Set(WellKnownDistributedTaskVariables.TaskInstanceName, Task.Name);
@@ -74,30 +109,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 Definition definition = taskManager.Load(Task);
                 ArgUtil.NotNull(definition, nameof(definition));
 
-                // Verify task signatures if a fingerprint is configured for the Agent.
-                var configurationStore = HostContext.GetService<IConfigurationStore>();
-                AgentSettings settings = configurationStore.GetSettings();
-
-                if (!String.IsNullOrEmpty(settings.Fingerprint))
-                {
-                    ISignatureService signatureService = HostContext.CreateService<ISignatureService>();
-                    Boolean verificationSuccessful =  await signatureService.VerifyAsync(definition, ExecutionContext.CancellationToken);
-
-                    if (verificationSuccessful)
-                    {
-                        ExecutionContext.Output("Task signature verification successful.");
-
-                        // Only extract if it's not the checkout task.
-                        if (!String.IsNullOrEmpty(definition.ZipPath))
-                        {
-                            taskManager.Extract(ExecutionContext, Task);
-                        }
-                    }
-                    else
-                    {
-                        throw new Exception("Task signature verification failed.");
-                    }
-                }
+                // Verify Signatures and Re-Extract Tasks if neccessary
+                await VerifyTask(taskManager, definition);
 
                 // Print out task metadata
                 PrintTaskMetaData(definition);
@@ -122,12 +135,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 {
                     if (PlatformUtil.RunningOnWindows)
                     {
-                        throw new Exception(StringUtil.Loc("SupportedTaskHandlerNotFoundWindows", $"{PlatformUtil.HostOS}({PlatformUtil.HostArchitecture})"));
+                        throw new InvalidOperationException(StringUtil.Loc("SupportedTaskHandlerNotFoundWindows", $"{PlatformUtil.HostOS}({PlatformUtil.HostArchitecture})"));
                     }
 
-                    throw new Exception(StringUtil.Loc("SupportedTaskHandlerNotFoundLinux"));
+                    throw new InvalidOperationException(StringUtil.Loc("SupportedTaskHandlerNotFoundLinux"));
                 }
                 Trace.Info($"Handler data is of type {handlerData}");
+                if (!AgentKnobs.UseNewNodeHandlerTelemetry.GetValue(ExecutionContext).AsBoolean())
+                {
+                    PublishTelemetry(definition, handlerData);
+                }
 
                 Variables runtimeVariables = ExecutionContext.Variables;
                 IStepHost stepHost = HostContext.CreateService<IDefaultStepHost>();
@@ -135,24 +152,46 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 // Setup container stephost and the right runtime variables for running job inside container.
                 if (stepTarget is ContainerInfo containerTarget)
                 {
+                    if (Stage == JobRunStage.PostJob
+                        && AgentKnobs.SkipPostExeceutionIfTargetContainerStopped.GetValue(ExecutionContext).AsBoolean())
+                    {
+                        try
+                        {
+                            // Check that the target container is still running, if not Skip task execution
+                            IDockerCommandManager dockerManager = HostContext.GetService<IDockerCommandManager>();
+                            bool isContainerRunning = await dockerManager.IsContainerRunning(ExecutionContext, containerTarget.ContainerId);
+
+                            if (!isContainerRunning)
+                            {
+                                ExecutionContext.Result = TaskResult.Skipped;
+                                ExecutionContext.ResultCode = $"Target container - {containerTarget.ContainerName} has been stopped, task post-execution will be skipped";
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ExecutionContext.Write(WellKnownTags.Warning, $"Failed to check container state for task post-execution. Exception: {ex}");
+                        }
+                    }
+
                     if (handlerData is AgentPluginHandlerData)
                     {
                         // plugin handler always runs on the Host, the runtime variables needs to the variable works on the Host, ex: file path variable System.DefaultWorkingDirectory
                         Dictionary<string, VariableValue> variableCopy = new Dictionary<string, VariableValue>(StringComparer.OrdinalIgnoreCase);
                         foreach (var publicVar in ExecutionContext.Variables.Public)
                         {
-                            variableCopy[publicVar.Key] = new VariableValue(stepTarget.TranslateToHostPath(publicVar.Value));
+                            variableCopy[publicVar.Name] = new VariableValue(stepTarget.TranslateToHostPath(publicVar.Value));
                         }
                         foreach (var secretVar in ExecutionContext.Variables.Private)
                         {
-                            variableCopy[secretVar.Key] = new VariableValue(stepTarget.TranslateToHostPath(secretVar.Value), true);
+                            variableCopy[secretVar.Name] = new VariableValue(stepTarget.TranslateToHostPath(secretVar.Value), true);
                         }
 
                         List<string> expansionWarnings;
                         runtimeVariables = new Variables(HostContext, variableCopy, out expansionWarnings);
                         expansionWarnings?.ForEach(x => ExecutionContext.Warning(x));
                     }
-                    else if (handlerData is NodeHandlerData || handlerData is Node10HandlerData || handlerData is PowerShell3HandlerData)
+                    else if (handlerData is BaseNodeHandlerData || handlerData is PowerShell3HandlerData)
                     {
                         // Only the node, node10, and powershell3 handlers support running inside container.
                         // Make sure required container is already created.
@@ -169,15 +208,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
                 // Load the default input values from the definition.
                 Trace.Verbose("Loading default inputs.");
-                var inputs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var input in (definition.Data?.Inputs ?? new TaskInputDefinition[0]))
-                {
-                    string key = input?.Name?.Trim() ?? string.Empty;
-                    if (!string.IsNullOrEmpty(key))
-                    {
-                        inputs[key] = input.DefaultValue?.Trim() ?? string.Empty;
-                    }
-                }
+                var inputs = LoadDefaultInputs(definition);
 
                 // Merge the instance inputs.
                 Trace.Verbose("Loading instance inputs.");
@@ -186,13 +217,37 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     string key = input.Key?.Trim() ?? string.Empty;
                     if (!string.IsNullOrEmpty(key))
                     {
-                        inputs[key] = input.Value?.Trim() ?? string.Empty;
+                        if (AgentKnobs.DisableInputTrimming.GetValue(ExecutionContext).AsBoolean())
+                        {
+                            inputs[key] = input.Value ?? string.Empty;
+                        }
+                        else
+                        {
+                            inputs[key] = input.Value?.Trim() ?? string.Empty;
+                        }
                     }
                 }
 
                 // Expand the inputs.
                 Trace.Verbose("Expanding inputs.");
-                runtimeVariables.ExpandValues(target: inputs);
+                bool enableVariableInputTrimmingKnob = AgentKnobs.EnableVariableInputTrimming.GetValue(ExecutionContext).AsBoolean();
+                runtimeVariables.ExpandValues(target: inputs, enableVariableInputTrimmingKnob);
+
+                // We need to verify inputs of the tasks that were injected by decorators, to check if they contain secrets,
+                // for security reasons execution of tasks in this case should be skipped.
+                // Target task inputs could be injected into the decorator's tasks if the decorator has post-task-tasks or pre-task-tasks targets,
+                // such tasks will have names that start with __system_pretargettask_ or __system_posttargettask_.
+                var taskDecoratorManager = HostContext.GetService<ITaskDecoratorManager>();
+                if (taskDecoratorManager.IsInjectedTaskForTarget(Task.Name, ExecutionContext) &&
+                    taskDecoratorManager.IsInjectedInputsContainsSecrets(inputs, out var inputsWithSecrets))
+                {
+                    var inputsForReport = taskDecoratorManager.GenerateTaskResultMessage(inputsWithSecrets);
+
+                    ExecutionContext.Result = TaskResult.Skipped;
+                    ExecutionContext.ResultCode = StringUtil.Loc("SecretsAreNotAllowedInInjectedTaskInputs", inputsForReport);
+                    return;
+                }
+
                 VarUtil.ExpandEnvironmentVariables(HostContext, target: inputs);
 
                 // Translate the server file path inputs to local paths.
@@ -345,8 +400,125 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     runtimeVariables,
                     taskDirectory: definition.Directory);
 
+                if (AgentKnobs.EnableIssueSourceValidation.GetValue(ExecutionContext).AsBoolean())
+                {
+                    if (Task.IsServerOwned.HasValue && Task.IsServerOwned.Value && IsCorrelationIdRequired(handler, definition))
+                    {
+                        environment[Constants.CommandCorrelationIdEnvVar] = ExecutionContext.JobSettings[WellKnownJobSettings.CommandCorrelationId];
+                    }
+                }
+
+                var enableResourceUtilizationWarnings = AgentKnobs.EnableResourceUtilizationWarnings.GetValue(ExecutionContext).AsBoolean()
+                    && !AgentKnobs.DisableResourceUtilizationWarnings.GetValue(ExecutionContext).AsBoolean();
+
+                //Start Resource utility monitors
+                IResourceMetricsManager resourceDiagnosticManager = null;
+
+                resourceDiagnosticManager = HostContext.GetService<IResourceMetricsManager>();
+                resourceDiagnosticManager.SetContext(ExecutionContext);
+
+                if (enableResourceUtilizationWarnings)
+                {
+                    _ = resourceDiagnosticManager.RunMemoryUtilizationMonitorAsync();
+                    _ = resourceDiagnosticManager.RunDiskSpaceUtilizationMonitorAsync();
+                    _ = resourceDiagnosticManager.RunCpuUtilizationMonitorAsync(Task.Reference.Id.ToString());
+                }
+                else
+                {
+                    ExecutionContext.Debug(StringUtil.Loc("ResourceUtilizationWarningsIsDisabled"));
+                }
+
                 // Run the task.
-                await handler.RunAsync();
+                int retryCount = this.Task.RetryCountOnTaskFailure;
+
+                if (retryCount > 0)
+                {
+                    if (retryCount > RetryCountOnTaskFailureLimit)
+                    {
+                        ExecutionContext.Warning(StringUtil.Loc("RetryCountLimitExceeded", RetryCountOnTaskFailureLimit, retryCount));
+                        retryCount = RetryCountOnTaskFailureLimit;
+                    }
+
+                    RetryHelper rh = new RetryHelper(ExecutionContext, retryCount);
+                    await rh.RetryStep(async () => await handler.RunAsync(), RetryHelper.ExponentialDelay);
+                }
+                else
+                {
+                    await handler.RunAsync();
+                }
+            }
+        }
+
+        private  Dictionary<string, string> LoadDefaultInputs(Definition definition)
+        {
+            Trace.Verbose("Loading default inputs.");
+            var inputs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var input in (definition.Data?.Inputs ?? new TaskInputDefinition[0]))
+            {
+                string key = input?.Name?.Trim() ?? string.Empty;
+                if (!string.IsNullOrEmpty(key))
+                {
+                    if (AgentKnobs.DisableInputTrimming.GetValue(ExecutionContext).AsBoolean())
+                    {
+                        inputs[key] = input.DefaultValue ?? string.Empty;
+                    }
+                    else
+                    {
+                        inputs[key] = input.DefaultValue?.Trim() ?? string.Empty;
+                    }
+                }
+            }
+
+            return inputs;
+        }
+        
+        public async Task VerifyTask(ITaskManager taskManager, Definition definition)
+        {
+            // Verify task signatures if a fingerprint is configured for the Agent.
+            var configurationStore = HostContext.GetService<IConfigurationStore>();
+            AgentSettings settings = configurationStore.GetSettings();
+            SignatureVerificationMode verificationMode = SignatureVerificationMode.None;
+            if (settings.SignatureVerification != null)
+            {
+                verificationMode = settings.SignatureVerification.Mode;
+            }
+
+            if (verificationMode != SignatureVerificationMode.None)
+            {
+                ISignatureService signatureService = HostContext.CreateService<ISignatureService>();
+                Boolean verificationSuccessful = await signatureService.VerifyAsync(definition, ExecutionContext.CancellationToken);
+
+                if (verificationSuccessful)
+                {
+                    ExecutionContext.Output(StringUtil.Loc("TaskSignatureVerificationSucceeeded"));
+
+                    // Only extract if it's not the checkout task.
+                    if (!String.IsNullOrEmpty(definition.ZipPath))
+                    {
+                        taskManager.Extract(ExecutionContext, Task);
+                    }
+                }
+                else
+                {
+                    String message = StringUtil.Loc("TaskSignatureVerificationFailed");
+
+                    if (verificationMode == SignatureVerificationMode.Error)
+                    {
+                        throw new InvalidOperationException(message);
+                    }
+                    else
+                    {
+                        ExecutionContext.Warning(message);
+                    }
+                }
+            }
+            else if (settings.AlwaysExtractTask)
+            {
+                // Only extract if it's not the checkout task.
+                if (!String.IsNullOrEmpty(definition.ZipPath))
+                {
+                    taskManager.Extract(ExecutionContext, Task);
+                }
             }
         }
 
@@ -371,19 +543,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
             var stepTarget = ExecutionContext.StepTarget();
             var preferPowershellHandler = true;
-            var preferPowershellHandlerOnContainers = ExecutionContext.Variables.GetBoolean("agent.preferPowerShellOnContainers")
-                ?? StringUtil.ConvertToBoolean(System.Environment.GetEnvironmentVariable("AGENT_PREFER_POWERSHELL_ON_CONTAINERS"), false);
-            if (!preferPowershellHandlerOnContainers && stepTarget != null)
+            if (!AgentKnobs.PreferPowershellHandlerOnContainers.GetValue(ExecutionContext).AsBoolean() && stepTarget != null)
             {
                 targetOS = stepTarget.ExecutionOS;
                 if (stepTarget is ContainerInfo)
                 {
                     if ((currentExecution.All.Any(x => x is PowerShell3HandlerData)) &&
-                        (currentExecution.All.Any(x => x is NodeHandlerData || x is Node10HandlerData)))
-                        {
-                            Trace.Info($"Since we are targeting a container, we will prefer a node handler if one is available");
-                            preferPowershellHandler = false;
-                        }
+                        (currentExecution.All.Any(x => x is BaseNodeHandlerData)))
+                    {
+                        Trace.Info($"Since we are targeting a container, we will prefer a node handler if one is available");
+                        preferPowershellHandler = false;
+                    }
                 }
             }
             Trace.Info($"Get handler data for target platform {targetOS.ToString()}");
@@ -447,19 +617,121 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             return inputValue;
         }
 
+        private bool IsTelemetryPublishRequired()
+        {
+            // Publish if this is a server owned task or a task we want to track.
+            return !Task.IsServerOwned.HasValue ||
+                   (Task.IsServerOwned.HasValue && Task.IsServerOwned.Value) ||
+                    WellKnownTasks.RequiredForTelemetry.Contains(Task.Reference.Id);
+        }
+
         private void PrintTaskMetaData(Definition taskDefinition)
         {
             ArgUtil.NotNull(Task, nameof(Task));
             ArgUtil.NotNull(Task.Reference, nameof(Task.Reference));
             ArgUtil.NotNull(taskDefinition.Data, nameof(taskDefinition.Data));
 
-            ExecutionContext.Output("==============================================================================");
-            ExecutionContext.Output($"Task         : {taskDefinition.Data.FriendlyName}");
-            ExecutionContext.Output($"Description  : {taskDefinition.Data.Description}");
-            ExecutionContext.Output($"Version      : {Task.Reference.Version}");
-            ExecutionContext.Output($"Author       : {taskDefinition.Data.Author}");
-            ExecutionContext.Output($"Help         : {taskDefinition.Data.HelpUrl ?? taskDefinition.Data.HelpMarkDown}");
-            ExecutionContext.Output("==============================================================================");
+            ExecutionContext.Output("==============================================================================", false);
+            ExecutionContext.Output($"Task         : {taskDefinition.Data.FriendlyName}", false);
+            ExecutionContext.Output($"Description  : {taskDefinition.Data.Description}", false);
+            ExecutionContext.Output($"Version      : {Task.Reference.Version}", false);
+            ExecutionContext.Output($"Author       : {taskDefinition.Data.Author}", false);
+            ExecutionContext.Output($"Help         : {taskDefinition.Data.HelpUrl ?? taskDefinition.Data.HelpMarkDown}", false);
+            ExecutionContext.Output("==============================================================================", false);
+        }
+
+        private void PublishTelemetry(Definition taskDefinition, HandlerData handlerData)
+        {
+            ArgUtil.NotNull(Task, nameof(Task));
+            ArgUtil.NotNull(Task.Reference, nameof(Task.Reference));
+            ArgUtil.NotNull(taskDefinition.Data, nameof(taskDefinition.Data));
+
+            try
+            {
+                var useNode10 = AgentKnobs.UseNode10.GetValue(ExecutionContext).AsString();
+                var expectedExecutionHandler = (taskDefinition.Data.Execution?.All != null) ? string.Join(", ", taskDefinition.Data.Execution.All) : "";
+                var systemVersion = PlatformUtil.GetSystemVersion();
+
+                Dictionary<string, string> telemetryData = new Dictionary<string, string>
+                {
+                    { "TaskName", Task.Reference.Name },
+                    { "TaskId", Task.Reference.Id.ToString() },
+                    { "Version", Task.Reference.Version },
+                    { "OS", PlatformUtil.GetSystemId() ?? "" },
+                    { "OSVersion", systemVersion?.Name?.ToString() ?? "" },
+                    { "OSBuild", systemVersion?.Version?.ToString() ?? "" },
+                    { "ExpectedExecutionHandler", expectedExecutionHandler },
+                    { "RealExecutionHandler", handlerData.ToString() },
+                    { "UseNode10", useNode10 },
+                    { "JobId", ExecutionContext.Variables.System_JobId.ToString()},
+                    { "PlanId", ExecutionContext.Variables.Get(Constants.Variables.System.PlanId)},
+                    { "AgentName", ExecutionContext.Variables.Get(Constants.Variables.Agent.Name)},
+                    { "AgentPackageType", BuildConstants.AgentPackage.PackageType },
+                    { "MachineName", ExecutionContext.Variables.Get(Constants.Variables.Agent.MachineName)},
+                    { "IsSelfHosted", ExecutionContext.Variables.Get(Constants.Variables.Agent.IsSelfHosted)},
+                    { "IsAzureVM", ExecutionContext.Variables.Get(Constants.Variables.System.IsAzureVM)},
+                    { "IsDockerContainer", ExecutionContext.Variables.Get(Constants.Variables.System.IsDockerContainer)}
+                };
+
+                var cmd = new Command("telemetry", "publish");
+                cmd.Data = JsonConvert.SerializeObject(telemetryData, Formatting.None);
+                cmd.Properties.Add("area", "PipelinesTasks");
+                cmd.Properties.Add("feature", "ExecutionHandler");
+
+                var publishTelemetryCmd = new TelemetryCommandExtension();
+                publishTelemetryCmd.Initialize(HostContext);
+                publishTelemetryCmd.ProcessCommand(ExecutionContext, cmd);
+            }
+            catch (Exception ex) when (ex is FormatException || ex is ArgumentNullException || ex is NullReferenceException)
+            {
+                ExecutionContext.Debug($"ExecutionHandler telemetry wasn't published, because one of the variables has unexpected value.");
+                ExecutionContext.Debug(ex.ToString());
+            }
+        }
+
+        private bool IsCorrelationIdRequired(IHandler handler, Definition task)
+        {
+            Trace.Entering();
+            var isIdRequired = false;
+
+            if (handler is INodeHandler)
+            {
+                Trace.Info("Current handler is Node. Trying to determing the SDK version.");
+                var nodeSdkVer = task.GetNodeSDKVersion();
+
+                if (nodeSdkVer == null)
+                {
+                    Trace.Error("Unable to determine the Node SDK version.");
+                }
+                else
+                {
+                    var minVer = new TaskVersion() { Major = 4, Minor = 10, Patch = 1 };
+                    isIdRequired = (nodeSdkVer >= minVer) && !((nodeSdkVer.Major == 5) && nodeSdkVer.IsTest);
+                    Trace.Info($"Node SDK version: {nodeSdkVer}. Correlation ID is required: {isIdRequired}.");
+                }
+            }
+            else if (handler is IPowerShell3Handler)
+            {
+                Trace.Info("Current handler is PowerShell3. Trying to determing the SDK version.");
+                var psSdkVer = task.GetPowerShellSDKVersion();
+                if (psSdkVer == null)
+                {
+                    Trace.Error("Unable to determine the PowerShell SDK version.");
+                }
+                else
+                {
+                    var minVer = new TaskVersion() { Major = 0, Minor = 20, Patch = 1 };
+                    isIdRequired = psSdkVer >= minVer;
+                    Trace.Info($"PowerShell SDK version: {psSdkVer}. Correlation ID is required: {isIdRequired}.");
+                }
+            }
+            else
+            {
+                Trace.Info($"Current handler is {handler.GetType()}. Correlation ID is not allowed.");
+            }
+
+            Trace.Leaving();
+            return isIdRequired;
         }
     }
 }

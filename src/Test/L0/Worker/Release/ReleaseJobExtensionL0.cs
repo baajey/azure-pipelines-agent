@@ -116,7 +116,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Release
         private TestHostContext Setup([CallerMemberName] string name = "", bool createWorkDirectory = true, bool useReleaseDefinitionId = true, bool setupArtifactsDirectory = false)
         {
             TestHostContext hc = new TestHostContext(this, name);
-            this.stubWorkFolder =hc.GetDirectory(WellKnownDirectory.Work);
+            this.stubWorkFolder = hc.GetDirectory(WellKnownDirectory.Work);
             if (createWorkDirectory)
             {
                 Directory.CreateDirectory(this.stubWorkFolder);
@@ -135,7 +135,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Release
                 ? GetReleaseVariables(id.ToString(), bool.TrueString)
                 : GetReleaseVariables(null, bool.TrueString);
 
-            if(setupArtifactsDirectory)
+            if (setupArtifactsDirectory)
             {
                 releaseVariables.Add(Constants.Variables.Release.ArtifactsDirectory, this.stubWorkFolder);
             }
@@ -146,7 +146,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker.Release
             hc.SetSingleton(_extensionManager.Object);
             hc.SetSingleton(_configurationStore.Object);
             _ec.Setup(x => x.Variables).Returns(_variables);
-            _ec.Setup(x => x.SetVariable(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>())).Callback((string varName, string varValue, bool isSecret, bool isOutput, bool isFilePath, bool isReadOnly) => { _variables.Set(varName, varValue, false); });
+            _ec.Setup(x => x.SetVariable(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>())).Callback((string varName, string varValue, bool isSecret, bool isOutput, bool isFilePath, bool isReadOnly, bool preserveCase) => { _variables.Set(varName, varValue, false); });
             _extensionManager.Setup(x => x.GetExtensions<ISourceProvider>())
                 .Returns(new List<ISourceProvider> { _sourceProvider.Object });
             _sourceProvider.Setup(x => x.RepositoryType).Returns(RepositoryTypes.TfsGit);

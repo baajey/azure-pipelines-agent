@@ -1,15 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using Agent.Sdk.Knob;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Microsoft.VisualStudio.Services.Agent.Capabilities
 {
+    [SupportedOSPlatform("windows")]
     public sealed class PowerShellCapabilitiesProvider : AgentService, ICapabilitiesProvider
     {
         public Type ExtensionType => typeof(ICapabilitiesProvider);
@@ -24,7 +27,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Capabilities
             string powerShellExe = HostContext.GetService<IPowerShellExeUtil>().GetPath();
             string scriptFile = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Bin), "powershell", "Add-Capabilities.ps1").Replace("'", "''");
             ArgUtil.File(scriptFile, nameof(scriptFile));
-            string arguments = $@"-NoLogo -Sta -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -Command "". '{scriptFile}'""";
+            string arguments = $@"-NoLogo -Sta -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -Command "". '{scriptFile}'""";
+
+            string enablePrereleaseVSVersions = AgentKnobs.EnableVSPreReleaseVersions.GetValue(UtilKnobValueContext.Instance()).AsString();
+            Environment.SetEnvironmentVariable("IncludePrereleaseVersions", enablePrereleaseVSVersions);
             using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
             {
                 processInvoker.OutputDataReceived +=
@@ -61,7 +67,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Capabilities
         {
             Command command;
             string name;
-            if (Command.TryParse(input, out command) &&
+            if (Command.TryParse(input, false, out command) &&
                 string.Equals(command.Area, "agent", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(command.Event, "capability", StringComparison.OrdinalIgnoreCase) &&
                 command.Properties.TryGetValue("name", out name) &&

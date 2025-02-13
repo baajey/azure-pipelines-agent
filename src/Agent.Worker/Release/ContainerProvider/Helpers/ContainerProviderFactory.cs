@@ -10,7 +10,8 @@ using Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEngine;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerProvider.Helpers
 {
-    public sealed class ContainerProviderFactory : IDisposable
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Maintainability", "CA1001:Types that own disposable fields should be disposable ", MessageId = "_retryOnTimeoutMessageHandler")]
+    public sealed class ContainerProviderFactory
     {
         private readonly BuildArtifactDetails _buildArtifactDetails;
         private readonly string _rootLocation;
@@ -39,7 +40,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerProvider
                 executionLogger);
         }
 
-        public IContainerProvider GetContainerProvider(string containerType)
+        public IContainerProvider GetContainerProvider(string containerType, bool skipServerCertificateValidation = false)
         {
             switch (containerType)
             {
@@ -53,18 +54,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerProvider
                         this._buildArtifactDetails.AccessToken,
                         this._retryOnTimeoutMessageHandler,
                         this._executionContext,
-                        includeDownloadTickets: true);
+                        includeDownloadTickets: true,
+                        skipServerCertificateValidation);
 
                     return fileContainerItemCache;
 
                 default:
                     throw new ArtifactDownloadException((StringUtil.Loc("RMArtifactTypeNotSupported", containerType)));
             }
-        }
-
-        public void Dispose()
-        {
-            _retryOnTimeoutMessageHandler?.Dispose();
         }
     }
 }

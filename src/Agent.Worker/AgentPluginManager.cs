@@ -41,7 +41,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             "Agent.Plugins.PipelineArtifact.DownloadPipelineArtifactTaskV1_1_2, Agent.Plugins",
             "Agent.Plugins.PipelineArtifact.DownloadPipelineArtifactTaskV1_1_3, Agent.Plugins",
             "Agent.Plugins.PipelineArtifact.DownloadPipelineArtifactTaskV2_0_0, Agent.Plugins",
-            "Agent.Plugins.PipelineArtifact.PublishPipelineArtifactTaskV0_140_0, Agent.Plugins"
+            "Agent.Plugins.PipelineArtifact.PublishPipelineArtifactTaskV0_140_0, Agent.Plugins",
+            "Agent.Plugins.BuildArtifacts.DownloadBuildArtifactTaskV1_0_0, Agent.Plugins"
         };
 
         public override void Initialize(IHostContext hostContext)
@@ -104,7 +105,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             // TODO: look to see if there is a better way to not have translate these back
             if (containerInfo != null)
             {
-                var newInputs = new Dictionary<string,string>();
+                var newInputs = new Dictionary<string, string>();
                 foreach (var entry in inputs)
                 {
                     newInputs[entry.Key] = containerInfo.TranslateToHostPath(entry.Value);

@@ -5,6 +5,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+
+using Agent.Sdk.Knob;
+
 using Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
 
@@ -35,7 +38,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
         string GetRelativeRepositoryPath(
             string buildDirectory,
-            string repositoryPath);
+            string repositoryPath,
+            IExecutionContext executionContext);
     }
 
     public sealed class BuildDirectoryManager : AgentService, IBuildDirectoryManager
@@ -55,7 +59,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
             // Create the tracking config for this execution of the pipeline
             var agentSettings = HostContext.GetService<IConfigurationStore>().GetSettings();
-            var newConfig = trackingManager.Create(executionContext, repositories, ShouldOverrideBuildDirectory(repositories, agentSettings));
+            var shouldOverrideBuildDirectory = ShouldOverrideBuildDirectory(repositories, agentSettings);
+            var newConfig = trackingManager.Create(executionContext, repositories, shouldOverrideBuildDirectory);
 
             // Load the tracking config from the last execution of the pipeline
             var existingConfig = trackingManager.LoadExistingTrackingConfig(executionContext);
@@ -63,7 +68,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
             // If there aren't any major changes, merge the configurations and use the same workspace
             if (trackingManager.AreTrackingConfigsCompatible(executionContext, newConfig, existingConfig))
             {
-                newConfig = trackingManager.MergeTrackingConfigs(executionContext, newConfig, existingConfig);
+                bool disableOverrideTfvcBuildDirectoryKnob = AgentKnobs.DisableOverrideTfvcBuildDirectory.GetValue(executionContext).AsBoolean();
+                newConfig = trackingManager.MergeTrackingConfigs(executionContext, newConfig, existingConfig, shouldOverrideBuildDirectory && !disableOverrideTfvcBuildDirectoryKnob);
             }
             else if (existingConfig != null)
             {
@@ -111,16 +117,28 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
                 description: "binaries directory",
                 path: Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), newConfig.BuildDirectory, Constants.Build.Path.BinariesDirectory),
                 deleteExisting: cleanOption == BuildCleanOption.Binary);
+
+            var defaultSourceDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), newConfig.SourcesDirectory);
             CreateDirectory(
                 executionContext,
                 description: "source directory",
-                path: Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), newConfig.SourcesDirectory),
+                path: defaultSourceDirectory,
                 deleteExisting: cleanOption == BuildCleanOption.Source);
 
             // Set the default clone path for each repository (the Checkout task may override this later)
             foreach (var repository in repositories)
             {
-                var repoPath = GetDefaultRepositoryPath(executionContext, repository, newConfig.SourcesDirectory);
+                string repoPath = GetDefaultRepositoryPath(executionContext, repository, newConfig);
+
+                if (!string.Equals(repoPath, defaultSourceDirectory, StringComparison.Ordinal))
+                {
+                    CreateDirectory(
+                        executionContext,
+                        description: "repository source directory",
+                        path: repoPath,
+                        deleteExisting: cleanOption == BuildCleanOption.Source);
+                }
+
                 Trace.Info($"Set repository path for repository {repository.Alias} to '{repoPath}'");
                 repository.Properties.Set<string>(RepositoryPropertyNames.Path, repoPath);
             }
@@ -149,7 +167,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
             // Update the repositoryInfo on the config
             string buildDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), trackingConfig.BuildDirectory);
-            string relativeRepoPath = GetRelativeRepositoryPath(buildDirectory, repoPath);
+            string relativeRepoPath = GetRelativeRepositoryPath(buildDirectory, repoPath, executionContext);
             var effectedRepo = trackingConfig.RepositoryTrackingInfo.FirstOrDefault(r => string.Equals(r.Identifier, updatedRepository.Alias, StringComparison.OrdinalIgnoreCase));
             if (effectedRepo != null)
             {
@@ -173,19 +191,39 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
 
         public string GetRelativeRepositoryPath(
             string buildDirectory,
-            string repositoryPath)
+            string repositoryPath,
+            IExecutionContext executionContext)
         {
+            var maxRootDirectory = buildDirectory;
+            var workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work);
+            var allowWorkDirectoryRepositories = AgentKnobs.AllowWorkDirectoryRepositories.GetValue(executionContext).AsBoolean();
+
             ArgUtil.NotNullOrEmpty(buildDirectory, nameof(buildDirectory));
             ArgUtil.NotNullOrEmpty(repositoryPath, nameof(repositoryPath));
 
-            if (repositoryPath.StartsWith(buildDirectory + Path.DirectorySeparatorChar) || repositoryPath.StartsWith(buildDirectory + Path.AltDirectorySeparatorChar))
+            // resolve any potentially left over relative part of the path
+            repositoryPath = Path.GetFullPath(repositoryPath);
+
+            if (allowWorkDirectoryRepositories)
+            {
+                maxRootDirectory = workDirectory;
+            }
+
+            if (repositoryPath.StartsWith(maxRootDirectory + Path.DirectorySeparatorChar) || repositoryPath.StartsWith(maxRootDirectory + Path.AltDirectorySeparatorChar))
             {
                 // The sourcesDirectory in tracking file is a relative path to agent's work folder.
-                return repositoryPath.Substring(HostContext.GetDirectory(WellKnownDirectory.Work).Length + 1).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return repositoryPath.Substring(workDirectory.Length + 1).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             }
             else
             {
-                throw new ArgumentException($"Repository path '{repositoryPath}' should be located under agent's work directory '{buildDirectory}'.");
+                if (allowWorkDirectoryRepositories)
+                {
+                    throw new ArgumentException($"Repository path '{repositoryPath}' should be located under agent's work directory '{workDirectory}'.");
+                }
+                else
+                {
+                    throw new ArgumentException($"Repository path '{repositoryPath}' should be located under agent's build directory '{buildDirectory}'.");
+                }
             }
         }
 
@@ -193,7 +231,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
         {
             if (repositories?.Count == 1 && repositories[0].Type == RepositoryTypes.Tfvc)
             {
-                return settings.IsHosted;
+                return settings.IsMSHosted;
             }
             else
             {
@@ -278,18 +316,32 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Build
         private string GetDefaultRepositoryPath(
             IExecutionContext executionContext,
             RepositoryResource repository,
-            string defaultSourcesDirectory)
+            TrackingConfig newConfig
+            )
         {
+            string repoPath = String.Empty;
+            string workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work);
+
             if (RepositoryUtil.HasMultipleCheckouts(executionContext.JobSettings))
             {
                 // If we have multiple checkouts they should all be rooted to the sources directory (_work/1/s/repo1)
-                return Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), defaultSourcesDirectory, RepositoryUtil.GetCloneDirectory(repository));
+                var repoSourceDirectory = newConfig?.RepositoryTrackingInfo.Where(item => string.Equals(item.Identifier, repository.Alias, StringComparison.OrdinalIgnoreCase)).Select(item => item.SourcesDirectory).FirstOrDefault();
+                if (repoSourceDirectory != null)
+                {
+                    repoPath = Path.Combine(workDirectory, repoSourceDirectory);
+                }
+                else
+                {
+                    repoPath = Path.Combine(workDirectory, newConfig.SourcesDirectory, RepositoryUtil.GetCloneDirectory(repository));
+                }
             }
             else
             {
                 // For single checkouts, the repository is rooted to the sources folder (_work/1/s)
-                return Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), defaultSourcesDirectory);
+                repoPath = Path.Combine(workDirectory, newConfig.SourcesDirectory);
             }
+
+            return repoPath;
         }
     }
 }

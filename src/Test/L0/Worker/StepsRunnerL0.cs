@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Xunit;
 using Microsoft.TeamFoundation.DistributedTask.Expressions;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
+using Agent.Sdk;
 
 namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
 {
@@ -38,6 +39,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
             _ec = new Mock<IExecutionContext>();
             _ec.SetupAllProperties();
             _ec.Setup(x => x.Variables).Returns(_variables);
+            var rm = new Mock<IResourceMetricsManager>();
+            hc.SetSingleton<IResourceMetricsManager>(rm.Object);
             _stepsRunner = new StepsRunner();
             _stepsRunner.Initialize(hc);
             return hc;
@@ -407,7 +410,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
         {
             using (TestHostContext hc = CreateTestContext())
             {
-                var stepTarget = new Pipelines.StepTarget {
+                var stepTarget = new Pipelines.StepTarget
+                {
                     Target = "container"
                 };
                 var step = CreateStep(TaskResult.Succeeded, ExpressionManager.Succeeded);
@@ -425,6 +429,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
                             stepContext.Object.Result = r;
                         }
                     });
+                stepContext.Setup(x => x.GetScopedEnvironment()).Returns(new SystemEnvironment());
                 step.Setup(x => x.ExecutionContext).Returns(stepContext.Object);
 
                 // Act.
@@ -459,6 +464,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Tests.Worker
                     }
                 });
             stepContext.Object.Result = result;
+            stepContext.Setup(x => x.GetScopedEnvironment()).Returns(new SystemEnvironment());
             step.Setup(x => x.ExecutionContext).Returns(stepContext.Object);
 
             return step;

@@ -77,7 +77,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
 
                     if (item.FileLength == 0)
                     {
-                        CreateEmptyFile(localPath);
+                        CreateEmptyFile(localPath, token);
                         _newEmptyFiles++;
                     }
                     else
@@ -149,7 +149,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
 
             if (_downloadedFiles > 0)
             {
-                string message = StringUtil.Loc("RMDownloadProgressDetails", Math.Ceiling(_bytesDownloaded/(1024.0*1024.0)), Math.Floor(_bytesDownloaded/(1024.0*_elapsedDownloadTime.TotalSeconds)), _elapsedDownloadTime);
+                string message = StringUtil.Loc("RMDownloadProgressDetails", Math.Ceiling(_bytesDownloaded / (1024.0 * 1024.0)), Math.Floor(_bytesDownloaded / (1024.0 * _elapsedDownloadTime.TotalSeconds)), _elapsedDownloadTime);
                 ExecutionLogger.Output(message);
             }
         }
@@ -223,7 +223,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
 
                         lock (_lock)
                         {
-                            ExecutionLogger.Warning(StringUtil.Loc("RMDownloadTaskCompletedStatus", (int) timeSinceLastTaskCompletion.TotalMinutes));
+                            ExecutionLogger.Warning(StringUtil.Loc("RMDownloadTaskCompletedStatus", (int)timeSinceLastTaskCompletion.TotalMinutes));
                             foreach (IGrouping<TaskStatus, Task> group in taskStates)
                             {
                                 ExecutionLogger.Warning(StringUtil.Loc("RMDownloadTaskStates", group.Key, group.Count()));
@@ -268,7 +268,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
                 string tmpDownloadPath = downloadPath + ".download";
 
                 FileSystemManager.EnsureParentDirectory(tmpDownloadPath);
-                FileSystemManager.DeleteFile(downloadPath);
+                FileSystemManager.DeleteFile(downloadPath, cancellationToken);
 
                 ExecutionLogger.Output(StringUtil.Loc("RMDownloadStartDownloadOfFile", downloadPath));
 
@@ -300,7 +300,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
                 timeBetweenRetries += timeBetweenRetries;
 
                 // Delete the tmp file inbetween attempts
-                FileSystemManager.DeleteFile(tmpDownloadPath);
+                FileSystemManager.DeleteFile(tmpDownloadPath, cancellationToken);
 
                 try
                 {
@@ -335,7 +335,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
 
                     if (lastAttempt)
                     {
-                        throw new Exception(StringUtil.Loc("RMErrorDownloadingContainerItem", tmpDownloadPath, exception));
+                        throw new InvalidOperationException(StringUtil.Loc("RMErrorDownloadingContainerItem", tmpDownloadPath, exception));
                     }
 
                     lock (_lock)
@@ -349,10 +349,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker.Release.ContainerFetchEng
             }
         }
 
-        private void CreateEmptyFile(string downloadPath)
+        private void CreateEmptyFile(string downloadPath, CancellationToken cancellationToken)
         {
             FileSystemManager.EnsureParentDirectory(downloadPath);
-            FileSystemManager.DeleteFile(downloadPath);
+            FileSystemManager.DeleteFile(downloadPath, cancellationToken);
             FileSystemManager.CreateEmptyFile(downloadPath);
         }
 

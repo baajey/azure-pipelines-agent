@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Agent.Sdk;
+using Agent.Sdk.Knob;
 using Microsoft.TeamFoundation.Framework.Common;
 
 namespace Microsoft.VisualStudio.Services.Agent.Util
@@ -19,8 +20,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
     // The implementation of the process invoker does not hook up DataReceivedEvent and ErrorReceivedEvent of Process,
     // instead, we read both STDOUT and STDERR stream manually on separate thread.
     // The reason is we find a huge perf issue about process STDOUT/STDERR with those events.
-    public sealed partial class ProcessInvoker : IDisposable
+    public partial class ProcessInvoker : IDisposable
     {
+        public static readonly bool ContinueAfterCancelProcessTreeKillAttemptDefault = false;
         private Process _proc;
         private Stopwatch _stopWatch;
         private int _asyncStreamReaderCount = 0;
@@ -29,8 +31,9 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
         private readonly TaskCompletionSource<bool> _processExitedCompletionSource = new TaskCompletionSource<bool>();
         private readonly ConcurrentQueue<string> _errorData = new ConcurrentQueue<string>();
         private readonly ConcurrentQueue<string> _outputData = new ConcurrentQueue<string>();
-        private readonly TimeSpan _sigintTimeout = TimeSpan.FromMilliseconds(7500);
-        private readonly TimeSpan _sigtermTimeout = TimeSpan.FromMilliseconds(2500);
+        private readonly TimeSpan _defaultSigintTimeout = TimeSpan.FromMilliseconds(7500);
+        private readonly TimeSpan _defaultSigtermTimeout = TimeSpan.FromMilliseconds(2500);
+
         private ITraceWriter Trace { get; set; }
 
         private class AsyncManualResetEvent
@@ -59,15 +62,20 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
-        public bool DisableWorkerCommands {get; set; }
+        public bool DisableWorkerCommands { get; set; }
+        public bool TryUseGracefulShutdown { get; set; }
+        public TimeSpan SigintTimeout { get; set; }
+        public TimeSpan SigtermTimeout { get; set; }
 
         public event EventHandler<ProcessDataReceivedEventArgs> OutputDataReceived;
         public event EventHandler<ProcessDataReceivedEventArgs> ErrorDataReceived;
 
-        public ProcessInvoker(ITraceWriter trace, bool disableWorkerCommands = false)
+        public ProcessInvoker(ITraceWriter trace, bool disableWorkerCommands = false, TimeSpan? sigintTimeout = null, TimeSpan? sigtermTimeout = null)
         {
             this.Trace = trace;
             this.DisableWorkerCommands = disableWorkerCommands;
+            this.SigintTimeout = sigintTimeout ?? _defaultSigintTimeout;
+            this.SigtermTimeout = sigtermTimeout ?? _defaultSigtermTimeout;
         }
 
         public Task<int> ExecuteAsync(
@@ -194,6 +202,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 inheritConsoleHandler: inheritConsoleHandler,
                 keepStandardInOpen: false,
                 highPriorityProcess: false,
+                continueAfterCancelProcessTreeKillAttempt: ProcessInvoker.ContinueAfterCancelProcessTreeKillAttemptDefault,
                 cancellationToken: cancellationToken);
         }
 
@@ -209,6 +218,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             bool inheritConsoleHandler,
             bool keepStandardInOpen,
             bool highPriorityProcess,
+            bool continueAfterCancelProcessTreeKillAttempt,
             CancellationToken cancellationToken)
         {
             ArgUtil.Null(_proc, nameof(_proc));
@@ -225,6 +235,10 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             Trace.Info($"  Persist current code page: '{inheritConsoleHandler}'");
             Trace.Info($"  Keep redirected STDIN open: '{keepStandardInOpen}'");
             Trace.Info($"  High priority process: '{highPriorityProcess}'");
+            Trace.Info($"  ContinueAfterCancelProcessTreeKillAttempt: '{continueAfterCancelProcessTreeKillAttempt}'");
+            Trace.Info($"  Sigint timeout: '{SigintTimeout}'");
+            Trace.Info($"  Sigterm timeout: '{SigtermTimeout}'");
+            Trace.Info($"  Try to use graceful shutdown: {TryUseGracefulShutdown}");
 
             _proc = new Process();
             _proc.StartInfo.FileName = fileName;
@@ -315,13 +329,32 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 }
             }
 
-            using (var registration = cancellationToken.Register(async () => await CancelAndKillProcessTree(killProcessOnCancel)))
+            AsyncManualResetEvent afterCancelKillProcessTreeAttemptSignal = new AsyncManualResetEvent();
+            using (var registration = cancellationToken.Register(async () =>
+            {
+                await CancelAndKillProcessTree(killProcessOnCancel);
+
+                // signal to ensure we exit the loop after we attempt to cancel and kill the process tree (which is best effort)
+                afterCancelKillProcessTreeAttemptSignal.Set();
+            }))
             {
                 Trace.Info($"Process started with process id {_proc.Id}, waiting for process exit.");
+
                 while (true)
                 {
                     Task outputSignal = _outputProcessEvent.WaitAsync();
-                    var signaled = await Task.WhenAny(outputSignal, _processExitedCompletionSource.Task);
+                    Task[] tasks;
+
+                    if (continueAfterCancelProcessTreeKillAttempt)
+                    {
+                        tasks = new Task[] { outputSignal, _processExitedCompletionSource.Task, afterCancelKillProcessTreeAttemptSignal.WaitAsync() };
+                    }
+                    else
+                    {
+                        tasks = new Task[] { outputSignal, _processExitedCompletionSource.Task };
+                    }
+
+                    var signaled = await Task.WhenAny(tasks);
 
                     if (signaled == outputSignal)
                     {
@@ -338,7 +371,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 // data buffers one last time before returning
                 ProcessOutput();
 
-                Trace.Info($"Finished process {_proc.Id} with exit code {_proc.ExitCode}, and elapsed time {_stopWatch.Elapsed}.");
+                if (_proc.HasExited)
+                {
+                    Trace.Info($"Finished process {_proc.Id} with exit code {_proc.ExitCode}, and elapsed time {_stopWatch.Elapsed}.");
+                }
+                else
+                {
+                    Trace.Info($"Process _proc.HasExited={_proc.HasExited}, {_proc.Id},  and elapsed time {_stopWatch.Elapsed}.");
+                }
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -358,12 +398,16 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             GC.SuppressFinalize(this);
         }
 
-        private void Dispose(bool disposing)
+        protected virtual void Dispose(bool disposing)
         {
             if (disposing)
             {
                 if (_proc != null)
                 {
+                    //Dispose the standard output/error stream. Refer: https://github.com/dotnet/runtime/issues/58872
+                    _proc.StandardOutput?.Dispose();
+                    _proc.StandardError?.Dispose();
+
                     _proc.Dispose();
                     _proc = null;
                 }
@@ -415,19 +459,26 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
-        private async Task CancelAndKillProcessTree(bool killProcessOnCancel)
+        internal protected virtual async Task CancelAndKillProcessTree(bool killProcessOnCancel)
         {
+            bool gracefulShoutdown = TryUseGracefulShutdown && !killProcessOnCancel;
+
             ArgUtil.NotNull(_proc, nameof(_proc));
             if (!killProcessOnCancel)
             {
-                bool sigint_succeed = await SendSIGINT(_sigintTimeout);
+                bool sigint_succeed = await SendSIGINT(SigintTimeout);
                 if (sigint_succeed)
                 {
                     Trace.Info("Process cancelled successfully through Ctrl+C/SIGINT.");
                     return;
                 }
 
-                bool sigterm_succeed = await SendSIGTERM(_sigtermTimeout);
+                if (gracefulShoutdown)
+                {
+                    return;
+                }
+
+                bool sigterm_succeed = await SendSIGTERM(SigtermTimeout);
                 if (sigterm_succeed)
                 {
                     Trace.Info("Process terminate successfully through Ctrl+Break/SIGTERM.");
@@ -491,7 +542,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                     {
                         if (DisableWorkerCommands)
                         {
-                            line = Regex.Replace(line, "##vso", "**vso", RegexOptions.IgnoreCase);
+                            line = StringUtil.DeactivateVsoCommands(line);
                         }
                         dataBuffer.Enqueue(line);
                         _outputProcessEvent.Set();
@@ -532,7 +583,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                                 standardIn.Close();
                                 break;
                             }
-                    }
+                        }
                     }
                 }
 

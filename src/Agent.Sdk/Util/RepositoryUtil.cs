@@ -14,6 +14,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
     {
         public static readonly string IsPrimaryRepository = "system.isprimaryrepository";
         public static readonly string IsTriggeringRepository = "system.istriggeringrepository";
+        public static readonly string IsDefaultWorkingDirectoryRepository = "system.isdefaultworkingdirectoryrepository";
         public static readonly string DefaultPrimaryRepositoryName = "self";
         public static readonly string GitStandardBranchPrefix = "refs/heads/";
 
@@ -95,6 +96,17 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
+        public static bool IsWellKnownRepository(RepositoryResource repository, string repositoryFlagName)
+        {
+            if (repository == null)
+            {
+                return false;
+            }
+
+            // Look for flag in repository
+            return repository.Properties.Get<bool>(repositoryFlagName, false);
+        }
+
         /// <summary>
         /// This method returns the repository from the list that has a 'Path' that the localPath is parented to.
         /// If the localPath is not part of any of the repo paths, null is returned.
@@ -116,7 +128,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 {
                     var repoPath = repo.Properties.Get<string>(RepositoryPropertyNames.Path)?.TrimEnd(Path.DirectorySeparatorChar);
 
-                    if (!string.IsNullOrEmpty(repoPath) && 
+                    if (!string.IsNullOrEmpty(repoPath) &&
                         (localPath.Equals(repoPath, IOUtil.FilePathStringComparison)) ||
                          localPath.StartsWith(repoPath + Path.DirectorySeparatorChar, IOUtil.FilePathStringComparison))
                     {
@@ -157,7 +169,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             {
                 return RepositoryTypes.GitHub;
             }
-            else if (repositoryUrl.IndexOf(".visualstudio.com", StringComparison.OrdinalIgnoreCase) >= 0 
+            else if (repositoryUrl.IndexOf(".visualstudio.com", StringComparison.OrdinalIgnoreCase) >= 0
                   || repositoryUrl.IndexOf("dev.azure.com", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 if (repositoryUrl.IndexOf("/_git/", StringComparison.OrdinalIgnoreCase) >= 0)

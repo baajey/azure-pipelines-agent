@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-using Agent.Sdk;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -10,11 +9,19 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
+
+using Agent.Sdk;
+using Agent.Sdk.Knob;
 
 namespace Microsoft.VisualStudio.Services.Agent.Util
 {
     public static class IOUtil
     {
+        const int MAX_RETRY_DELETION = 3;
+
+        private static UtilKnobValueContext _knobContext = UtilKnobValueContext.Instance();
+
         public static string ExeExtension
         {
             get =>
@@ -31,6 +38,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 : StringComparison.OrdinalIgnoreCase;
         }
 
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1720: Identifiers should not contain type")]
         public static void SaveObject(object obj, string path)
         {
             File.WriteAllText(path, StringUtil.ConvertToJson(obj), Encoding.UTF8);
@@ -56,6 +64,25 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
                 }
 
                 string hash = sBuilder.ToString();
+                return hash;
+            }
+        }
+
+        public static string GetFileHash(string path)
+        {
+            using (SHA256 sha256hash = SHA256.Create())
+            {
+                FileInfo info = new FileInfo(path);
+                // Open the file.
+                FileStream stream = info.Open(FileMode.Open);
+                // Be sure the stream is positioned to the beginning of the file.
+                stream.Position = 0;
+                // Compute the hash of the file stream.
+                byte[] hashAsBytes = sha256hash.ComputeHash(stream);
+                // Close the file.
+                stream.Close();
+                // Convert the computed file hash from the byte array to a string.
+                string hash = BitConverter.ToString(hashAsBytes);
                 return hash;
             }
         }
@@ -200,6 +227,56 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
+        public static async Task DeleteDirectoryWithRetry(string path, CancellationToken cancellationToken)
+        {
+
+            for (int i = 1; i <= MAX_RETRY_DELETION; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    DeleteDirectory(path, cancellationToken);
+                    return;
+                }
+                // There is no reason to retry on DirectoryNotFoundException, SecruityException and UnauthorizedAccessException
+                // DeleteDirectory is parallel execution so returned exception is AggregateException (with InnerExeptions) rather than IOException
+                catch (AggregateException aex) when (i < MAX_RETRY_DELETION && aex.InnerExceptions.Any(ex => ex is IOException))
+                {
+                    // Pause execution briefly to allow the file to become accessible
+                    await Task.Delay(i * 1000, cancellationToken);
+                }
+
+                //Propogate exception if it is not possible to delete directory after retrying
+                catch (Exception)
+                {
+                    throw;
+                }
+            }
+        }
+        public static async Task DeleteFileWithRetry(string path, CancellationToken cancellationToken)
+        {
+            for (int i = 1; i <= MAX_RETRY_DELETION; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    DeleteFile(path);
+                    return;
+                }
+                // There is no reason to retry on FileNotFoundException, SecruityException and UnauthorizedAccessException
+                catch (IOException) when (i < MAX_RETRY_DELETION)
+                {
+                    // Pause execution briefly to allow the file to become accessible
+                    await Task.Delay(i * 1000, cancellationToken);
+                }
+
+                //Propogate exception if it is not possible to delete file after retrying
+                catch (Exception)
+                {
+                    throw;
+                }
+            }
+        }
         public static void MoveDirectory(string sourceDir, string targetDir, string stagingDir, CancellationToken token)
         {
             ArgUtil.Directory(sourceDir, nameof(sourceDir));
@@ -392,12 +469,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
         {
             ArgUtil.Directory(directory, nameof(directory));
             string dir = directory;
-            string failsafeString = Environment.GetEnvironmentVariable("AGENT_TEST_VALIDATE_EXECUTE_PERMISSIONS_FAILSAFE");
-            int failsafe;
-            if (string.IsNullOrEmpty(failsafeString) || !int.TryParse(failsafeString, out failsafe))
-            {
-                failsafe = 100;
-            }
+            int failsafe = AgentKnobs.PermissionsCheckFailsafe.GetValue(_knobContext).AsInt();
 
             for (int i = 0; i < failsafe; i++)
             {
@@ -454,12 +526,43 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             }
         }
 
+        private static string GetAttributesAsBinary(FileAttributes attributes)
+        {
+            return Convert.ToString((int)attributes, 2).PadLeft(16, '0');
+        }
+
+        private static void SetAttributesWithDiagnostics(FileSystemInfo item, FileAttributes newAttributes)
+        {
+            try
+            {
+                item.Attributes = newAttributes;
+            }
+            catch (ArgumentException ex)
+            {
+                string exceptionMessage = $@"ArgumentException was thrown when trying to set file attributes.
+  File path: {item.FullName}
+  File exists: {item.Exists}
+  File attributes:
+    Current attributes:
+      Readable:         {item.Attributes.ToString()}
+      As int:           {(int)item.Attributes}
+      As binary string: {GetAttributesAsBinary(item.Attributes)}
+    New attributes:
+      Readable:         {newAttributes.ToString()}
+      As int:           {(int)newAttributes}
+      As binary string: {GetAttributesAsBinary(newAttributes)}
+  Exception message: {ex.Message}";
+                throw new ArgumentException(exceptionMessage);
+            }
+        }
+
         private static void RemoveReadOnly(FileSystemInfo item)
         {
             ArgUtil.NotNull(item, nameof(item));
             if (item.Attributes.HasFlag(FileAttributes.ReadOnly))
             {
-                item.Attributes = item.Attributes & ~FileAttributes.ReadOnly;
+                FileAttributes newAttributes = item.Attributes & ~FileAttributes.ReadOnly;
+                SetAttributesWithDiagnostics(item, newAttributes);
             }
         }
 
@@ -472,7 +575,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Util
             if (platform == PlatformUtil.OS.Windows)
             {
                 var paths = path.TrimEnd('\\', '/')
-                                .Split(new char[] {'\\','/'}, StringSplitOptions.RemoveEmptyEntries);
+                                .Split(new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
                 Array.Resize(ref paths, paths.Length - 1);
                 return string.Join('\\', paths);
             }
